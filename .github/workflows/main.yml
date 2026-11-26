@@ -21,10 +21,32 @@ jobs:
     steps:
       - name: Download SoundFont and TinySoundFont
         run: |
-          curl -fsSL --retry 5 --retry-delay 3 -o tsf.h https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h
-          curl -fsSL --retry 5 --retry-delay 3 -o SoundFont.sf2 https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2
-          test -s tsf.h
-          head -c 4 SoundFont.sf2 | grep -q RIFF || (echo "::error::SoundFont download is not a valid .sf2" && exit 1)
+          download() {
+            out="$1"; shift
+            for url in "$@"; do
+              if curl -fsSL --retry 3 --retry-delay 3 -o "$out" "$url"; then
+                echo "Downloaded $out from $url"
+                return 0
+              fi
+              echo "Failed: $url"
+            done
+            return 1
+          }
+
+          download tsf.h \
+            https://raw.githubusercontent.com/schellingb/TinySoundFont/HEAD/tsf.h \
+            https://raw.githubusercontent.com/schellingb/TinySoundFont/main/tsf.h \
+            https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h \
+            || { echo "::error::Could not download tsf.h"; exit 1; }
+
+          download SoundFont.sf2 \
+            https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2 \
+            https://github.com/urish/cinto/raw/HEAD/media/TimGM6mb.sf2 \
+            https://github.com/schellingb/TinySoundFont/raw/HEAD/examples/florestan-subset.sf2 \
+            || { echo "::error::Could not download a SoundFont"; exit 1; }
+
+          grep -q TSF_IMPLEMENTATION tsf.h || { echo "::error::tsf.h is not valid"; exit 1; }
+          head -c 4 SoundFont.sf2 | grep -q RIFF || { echo "::error::SoundFont is not a valid .sf2"; exit 1; }
 
       - name: Create project files
         run: |
@@ -156,9 +178,9 @@ jobs:
             <EXPORTFORMATS>
               <ANDROIDSTUDIO targetFolder="Builds/Android" minSdkVersion="24" androidMicNeeded="1" androidInternetNeeded="1">
                 <CONFIGURATIONS>
-                  <CONFIGURATION name="Debug" isDebug="1" targetName="AILiveBand"
+                  <CONFIGURATION name="Debug" isDebug="1"
                     extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH"/>
-                  <CONFIGURATION name="Release" isDebug="0" targetName="AILiveBand" optimise="1"
+                  <CONFIGURATION name="Release" isDebug="0" optimise="1"
                     extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH"/>
                 </CONFIGURATIONS>
               </ANDROIDSTUDIO>
@@ -925,6 +947,13 @@ jobs:
           lines = [l for l in lines if not re.search(r"target_link_libraries.*AILiveBand", l)]
           abi_var = "$" + "{ANDROID_ABI}"
           inject = [
+              'function(target_link_libraries)',
+              '  if(TARGET "${ARGV0}")',
+              '    _target_link_libraries(${ARGV})',
+              '  else()',
+              '    message(WARNING "Skipping target_link_libraries for missing target ${ARGV0}")',
+              '  endif()',
+              'endfunction()',
               'include_directories("%s/ixwebsocket-android/include")' % ws,
               'link_libraries("%s/ixwebsocket-android/libs/%s/libixwebsocket.a")' % (ws, abi_var),
           ]
@@ -945,6 +974,8 @@ jobs:
           open(path, "w").write("\n".join(lines))
           PY
             grep -n "ixwebsocket" "$CMAKE_FILE" || (echo "::error::CMake patch did not apply" && exit 1)
+            echo "---- targets in generated CMake ----"
+            grep -nE "add_library|BINARY_NAME|^[[:space:]]*target_link_libraries" "$CMAKE_FILE" | head -40
           else
             echo "::error::$CMAKE_FILE not found" && exit 1
           fi
