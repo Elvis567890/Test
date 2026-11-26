@@ -882,15 +882,18 @@ jobs:
           # 3. Inject NDK version
           echo "android.ndkVersion=${{ env.ANDROID_NDK_VERSION }}" >> Builds/Android/gradle.properties
           
-          # ── SAFETY NET 1: Force-include headers and link using link_libraries ──
+          # ── SAFETY NET 1: Remove invalid target_link_libraries and use global link_libraries ──
           CMAKE_FILE="Builds/Android/app/CMakeLists.txt"
           if [ -f "$CMAKE_FILE" ]; then
-            echo "✅ Patching CMakeLists.txt to include IXWebSocket headers and link library..."
+            echo "✅ Patching CMakeLists.txt to remove invalid target links and apply global links..."
             
-            # 1. Force the C++ shared STL globally at the top of the file
+            # CRITICAL FIX: Delete the lines causing the "target AILiveBand not built by this project" error
+            sed -i '/target_link_libraries.*AILiveBand/d' "$CMAKE_FILE"
+            
+            # Force the C++ shared STL globally at the top of the file
             sed -i "1i set(ANDROID_STL c++_shared)" "$CMAKE_FILE"
             
-            # 2. Add include directory and link_libraries right after project() to bypass target name issues
+            # Add include directory and link_libraries globally right after project() to bypass target name issues
             sed -i "/project/a include_directories($GITHUB_WORKSPACE/ixwebsocket-android/include)" "$CMAKE_FILE"
             sed -i "/project/a link_libraries(\"$GITHUB_WORKSPACE/ixwebsocket-android/libs/\${ANDROID_ABI}/libixwebsocket.a\")" "$CMAKE_FILE"
           fi
@@ -906,16 +909,11 @@ jobs:
             && echo "✅ RECORD_AUDIO permission verified in manifest." \
             || (echo "::error::RECORD_AUDIO permission missing from manifest" && exit 1)
 
-          # ── SAFETY NET 3: Fix Gradle arguments placement ──
+          # ── SAFETY NET 3 & 4: Fix Gradle arguments placement ──
           GRADLE_FILE="Builds/Android/app/build.gradle"
           if [ -f "$GRADLE_FILE" ]; then
             echo "✅ Patching build.gradle to remove invalid CMake arguments..."
             sed -i '/DANDROID_STL=c++_shared/d' "$GRADLE_FILE"
-          fi
-
-          # ── SAFETY NET 4: Fix hardcoded Ninja path ──
-          if [ -f "$GRADLE_FILE" ]; then
-            echo "✅ Patching build.gradle to remove hardcoded CMAKE_MAKE_PROGRAM path..."
             sed -i '/CMAKE_MAKE_PROGRAM/d' "$GRADLE_FILE"
           fi
 
