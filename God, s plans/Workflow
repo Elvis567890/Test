@@ -1,5 +1,4 @@
-name: Build AI Live Band App
-
+name: Build AI Live Band App 
 on:
   push:
     branches: [ main, master, first-prototype ]
