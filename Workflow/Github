@@ -96,9 +96,10 @@ jobs:
           EOF
 
           # ── AILiveBand.jucer (ANDROID ONLY) ──
+          # Note: Changed name to "AILiveBand" to ensure CMake target name matches
           cat > AILiveBand.jucer << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
-          <JUCERPROJECT id="AILiveBand" name="AI Live Band" projectType="guiapp" version="0.1.0" companyName="AILiveBand" bundleIdentifier="com.ailiveband">
+          <JUCERPROJECT id="AILiveBand" name="AILiveBand" projectType="guiapp" version="0.1.0" companyName="AILiveBand" bundleIdentifier="com.ailiveband">
             <MAINGROUP id="m" name="AI Live Band">
               <GROUP id="g" name="Source">
                 <FILE id="f1" name="Main.cpp" compile="1" resource="0" file="Source/Main.cpp"/>
@@ -137,8 +138,14 @@ jobs:
             <EXPORTFORMATS>
               <ANDROIDSTUDIO targetFolder="Builds/Android" minSdkVersion="21" androidMicNeeded="1" androidExtraPermissions="android.permission.RECORD_AUDIO">
                 <CONFIGURATIONS>
-                  <CONFIGURATION name="Debug" isDebug="1" targetName="AILiveBand" extraLibrarySearchPaths="IXWEBSOCKET_LIB_PATH/${ANDROID_ABI}" extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH"/>
-                  <CONFIGURATION name="Release" isDebug="0" targetName="AILiveBand" optimise="1" extraLibrarySearchPaths="IXWEBSOCKET_LIB_PATH/${ANDROID_ABI}" extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH"/>
+                  <CONFIGURATION name="Debug" isDebug="1" targetName="AILiveBand" 
+                    extraLibrarySearchPaths="IXWEBSOCKET_LIB_PATH/${ANDROID_ABI}" 
+                    extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH" 
+                    extraLinkerFlags="-lixwebsocket"/>
+                  <CONFIGURATION name="Release" isDebug="0" targetName="AILiveBand" optimise="1" 
+                    extraLibrarySearchPaths="IXWEBSOCKET_LIB_PATH/${ANDROID_ABI}" 
+                    extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH" 
+                    extraLinkerFlags="-lixwebsocket"/>
                 </CONFIGURATIONS>
               </ANDROIDSTUDIO>
             </EXPORTFORMATS>
@@ -869,20 +876,16 @@ jobs:
           # 3. Inject NDK version
           echo "android.ndkVersion=${{ env.ANDROID_NDK_VERSION }}" >> Builds/Android/gradle.properties
           
-          # ── SAFETY NET 1: Force-include headers and link the static library in CMakeLists.txt ──
+          # ── SAFETY NET 1: Force-include headers and set STL in CMakeLists.txt ──
           CMAKE_FILE="Builds/Android/app/CMakeLists.txt"
           if [ -f "$CMAKE_FILE" ]; then
-            echo "✅ Patching CMakeLists.txt to include IXWebSocket headers, link the library, and force STL..."
+            echo "✅ Patching CMakeLists.txt to include IXWebSocket headers and force STL..."
             
             # 1. Force the C++ shared STL globally at the top of the file
             sed -i "1i set(ANDROID_STL c++_shared)" "$CMAKE_FILE"
             
             # 2. Add the include directory right after project()
             sed -i "/project/a include_directories($GITHUB_WORKSPACE/ixwebsocket-android/include)" "$CMAKE_FILE"
-            
-            # 3. Append the full path to the static library to the end of the file using the correct variable
-            # Note: \${BINARY_NAME} is evaluated by CMake, not bash, because of the backslash
-            echo "target_link_libraries(\${BINARY_NAME} PRIVATE ${GITHUB_WORKSPACE}/ixwebsocket-android/libs/\${ANDROID_ABI}/libixwebsocket.a)" >> "$CMAKE_FILE"
           fi
 
           # ── SAFETY NET 2: Ensure RECORD_AUDIO permission is present ──
