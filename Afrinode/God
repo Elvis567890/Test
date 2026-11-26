@@ -37,9 +37,11 @@ jobs:
           project(AILiveBand VERSION 0.1.0 LANGUAGES C CXX)
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          
           if(NOT ANDROID)
             find_package(OpenGL REQUIRED)
           endif()
+          
           add_subdirectory(JUCE)
 
           if(NOT ANDROID)
@@ -65,6 +67,7 @@ jobs:
           )
 
           juce_generate_juce_header(AILiveBand)
+          
           target_sources(AILiveBand PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/Source/Main.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Source/MainComponent.cpp
@@ -73,24 +76,28 @@ jobs:
             ${CMAKE_CURRENT_SOURCE_DIR}/Source/Arranger.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Source/SoundFontSynth.cpp
           )
+          
           target_compile_definitions(AILiveBand PRIVATE
             JUCE_WEB_BROWSER=0
             JUCE_USE_CURL=0
           )
+          
           if(NOT MSVC)
             target_compile_options(AILiveBand PRIVATE -Wno-zero-as-null-pointer-constant -Wno-unused-function)
           endif()
-          target_link_libraries(AILiveBand PRIVATE
-            BinaryData
-            juce::juce_audio_utils
-            juce::juce_audio_devices
-            juce::juce_dsp
-            juce::juce_gui_extra
-            PUBLIC
-            juce::juce_recommended_config_flags
-            juce::juce_recommended_warning_flags
-          )
+
+          # ── FIX: Apply target_link_libraries only for Desktop builds ──
           if(NOT ANDROID)
+            target_link_libraries(AILiveBand PRIVATE
+              BinaryData
+              juce::juce_audio_utils
+              juce::juce_audio_devices
+              juce::juce_dsp
+              juce::juce_gui_extra
+              PUBLIC
+              juce::juce_recommended_config_flags
+              juce::juce_recommended_warning_flags
+            )
             target_link_libraries(AILiveBand PRIVATE OpenGL::GL OpenGL::GLU juce::juce_events ixwebsocket)
           endif()
           EOF
