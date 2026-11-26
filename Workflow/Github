@@ -96,7 +96,6 @@ jobs:
           EOF
 
           # ── AILiveBand.jucer (ANDROID ONLY) ──
-          # Note: Removed -DANDROID_STL=c++_shared and EXTRA_LIBRARIES_TO_LINK to prevent Gradle crashes
           cat > AILiveBand.jucer << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <JUCERPROJECT id="AILiveBand" name="AI Live Band" projectType="guiapp" version="0.1.0" companyName="AILiveBand" bundleIdentifier="com.ailiveband">
@@ -744,6 +743,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: source }
 
+      # ── CACHE GRADLE WRAPPER (Prevents re-downloading on transient 504s) ──
+      - name: Cache Gradle Wrapper
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
       - name: Cache JUCE
         id: cache-juce
         uses: actions/cache@v4
@@ -774,6 +782,37 @@ jobs:
             libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev \
             libfreetype6-dev libfontconfig1-dev libasound2-dev libjack-jackd2-dev \
             ladspa-sdk libwebkit2gtk-4.1-dev libglu1-mesa-dev mesa-common-dev libegl-dev
+
+      # ── RETRY PREFETCH (Handles transient 504s with retries) ──
+      - name: Prefetch Gradle Distribution with Retries
+        run: |
+          PROPS_FILE="Builds/Android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$PROPS_FILE" ]; then
+            URL=$(sed -n 's/^distributionUrl=//p' "$PROPS_FILE" | sed 's/\\//g')
+            ZIP_NAME=${URL##*/}
+            DIST_NAME=${ZIP_NAME%.zip}
+            HASH=$(python3 -c "import hashlib; n=int.from_bytes(hashlib.md5('$URL'.encode()).digest(),'big'); d='0123456789abcdefghijklmnopqrstuvwxyz'; s='';
+          while n: n,r=divmod(n,36); s=d[r]+s
+          print(s)")
+            DIST_DIR="$HOME/.gradle/wrapper/dists/$DIST_NAME/$HASH"
+            mkdir -p "$DIST_DIR"
+            
+            if [ ! -f "$DIST_DIR/$ZIP_NAME" ]; then
+              for i in {1..8}; do
+                if curl -fsSL --connect-timeout 15 --max-time 300 -o "$DIST_DIR/$ZIP_NAME.part" "$URL" && \
+                   unzip -tq "$DIST_DIR/$ZIP_NAME.part" > /dev/null 2>&1; then
+                  mv "$DIST_DIR/$ZIP_NAME.part" "$DIST_DIR/$ZIP_NAME"
+                  echo "✅ Gradle distribution downloaded (attempt $i)"
+                  break
+                fi
+                echo "⚠️ Download failed (attempt $i/8), retrying in 15s..."
+                rm -f "$DIST_DIR/$ZIP_NAME.part"
+                sleep 15
+              done
+            else
+              echo "✅ Gradle distribution already cached."
+            fi
+          fi
 
       - name: Pre-build IXWebSocket for Android (all ABIs)
         run: |
@@ -841,8 +880,9 @@ jobs:
             # 2. Add the include directory right after project()
             sed -i "/project/a include_directories($GITHUB_WORKSPACE/ixwebsocket-android/include)" "$CMAKE_FILE"
             
-            # 3. Append the full path to the static library to the end of the file
-            echo "target_link_libraries(AILiveBand PRIVATE ${GITHUB_WORKSPACE}/ixwebsocket-android/libs/\${ANDROID_ABI}/libixwebsocket.a)" >> "$CMAKE_FILE"
+            # 3. Append the full path to the static library to the end of the file using the correct variable
+            # Note: \${BINARY_NAME} is evaluated by CMake, not bash, because of the backslash
+            echo "target_link_libraries(\${BINARY_NAME} PRIVATE ${GITHUB_WORKSPACE}/ixwebsocket-android/libs/\${ANDROID_ABI}/libixwebsocket.a)" >> "$CMAKE_FILE"
           fi
 
           # ── SAFETY NET 2: Ensure RECORD_AUDIO permission is present ──
