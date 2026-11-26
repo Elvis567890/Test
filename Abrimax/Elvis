@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   JUCE_VERSION: 8.0.6
   ANDROID_NDK_VERSION: 26.3.11579264
@@ -13,11 +17,14 @@ env:
 jobs:
   scaffold:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Download SoundFont and TinySoundFont
         run: |
-          curl -sL -o tsf.h https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h
-          curl -sL -o SoundFont.sf2 https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2
+          curl -fsSL --retry 5 --retry-delay 3 -o tsf.h https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h
+          curl -fsSL --retry 5 --retry-delay 3 -o SoundFont.sf2 https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2
+          test -s tsf.h
+          head -c 4 SoundFont.sf2 | grep -q RIFF || (echo "::error::SoundFont download is not a valid .sf2" && exit 1)
 
       - name: Create project files
         run: |
@@ -25,7 +32,7 @@ jobs:
           mv tsf.h Source/tsf.h
           mv SoundFont.sf2 Source/SoundFont.sf2
 
-          # ── Config.h (C++ Native Configuration) ──
+          # ── Config.h ──
           cat > Source/Config.h << 'EOF'
           #pragma once
           #define AI_LIVE_BAND_SERVER_URL "ws://13.140.90.83:8765"
@@ -37,24 +44,24 @@ jobs:
           project(AILiveBand VERSION 0.1.0 LANGUAGES C CXX)
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
-          
-          if(NOT ANDROID)
-            find_package(OpenGL REQUIRED)
-          endif()
-          
+
+          # IXWebSocket still declares an old cmake_minimum_required; CMake 4+ rejects that unless overridden.
+          set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
           add_subdirectory(JUCE)
 
-          if(NOT ANDROID)
-            include(FetchContent)
-            FetchContent_Declare(
-              ixwebsocket
-              GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
-              GIT_TAG        v11.4.4
-            )
-            set(USE_TLS OFF CACHE BOOL "Disable TLS for IXWebSocket")
-            set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build IXWebSocket as static library")
-            FetchContent_MakeAvailable(ixwebsocket)
-          endif()
+          include(FetchContent)
+          FetchContent_Declare(
+            ixwebsocket
+            GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
+            GIT_TAG        v11.4.4
+          )
+          set(USE_TLS  OFF CACHE BOOL "" FORCE)
+          set(USE_ZLIB OFF CACHE BOOL "" FORCE)
+          set(USE_TEST OFF CACHE BOOL "" FORCE)
+          set(USE_WS   OFF CACHE BOOL "" FORCE)
+          set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+          FetchContent_MakeAvailable(ixwebsocket)
 
           juce_add_binary_data(BinaryData SOURCES Source/SoundFont.sf2)
 
@@ -67,7 +74,7 @@ jobs:
           )
 
           juce_generate_juce_header(AILiveBand)
-          
+
           target_sources(AILiveBand PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/Source/Main.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Source/MainComponent.cpp
@@ -76,30 +83,35 @@ jobs:
             ${CMAKE_CURRENT_SOURCE_DIR}/Source/Arranger.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Source/SoundFontSynth.cpp
           )
-          
+
           target_compile_definitions(AILiveBand PRIVATE
             JUCE_WEB_BROWSER=0
             JUCE_USE_CURL=0
+            JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:AILiveBand,JUCE_PRODUCT_NAME>"
+            JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:AILiveBand,JUCE_VERSION>"
           )
-          
+
+          if(WIN32)
+            target_compile_definitions(AILiveBand PRIVATE NOMINMAX)
+          endif()
+
           if(NOT MSVC)
             target_compile_options(AILiveBand PRIVATE -Wno-zero-as-null-pointer-constant -Wno-unused-function)
           endif()
 
-          # ── FIX: Apply target_link_libraries only for Desktop builds ──
-          if(NOT ANDROID)
-            target_link_libraries(AILiveBand PRIVATE
+          target_link_libraries(AILiveBand
+            PRIVATE
               BinaryData
               juce::juce_audio_utils
               juce::juce_audio_devices
               juce::juce_dsp
               juce::juce_gui_extra
-              PUBLIC
+              juce::juce_events
+              ixwebsocket
+            PUBLIC
               juce::juce_recommended_config_flags
               juce::juce_recommended_warning_flags
-            )
-            target_link_libraries(AILiveBand PRIVATE OpenGL::GL OpenGL::GLU juce::juce_events ixwebsocket)
-          endif()
+          )
           EOF
 
           # ── AILiveBand.jucer (ANDROID ONLY) ──
@@ -142,16 +154,12 @@ jobs:
             </MODULES>
             <JUCEOPTIONS JUCE_WEB_BROWSER="0" JUCE_USE_CURL="0"/>
             <EXPORTFORMATS>
-              <ANDROIDSTUDIO targetFolder="Builds/Android" minSdkVersion="21" androidMicNeeded="1" androidExtraPermissions="android.permission.RECORD_AUDIO">
+              <ANDROIDSTUDIO targetFolder="Builds/Android" minSdkVersion="24" androidMicNeeded="1" androidInternetNeeded="1">
                 <CONFIGURATIONS>
-                  <CONFIGURATION name="Debug" isDebug="1" targetName="AILiveBand" 
-                    extraLibrarySearchPaths="IXWEBSOCKET_LIB_PATH/${ANDROID_ABI}" 
-                    extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH" 
-                    extraLinkerFlags="-lixwebsocket"/>
-                  <CONFIGURATION name="Release" isDebug="0" targetName="AILiveBand" optimise="1" 
-                    extraLibrarySearchPaths="IXWEBSOCKET_LIB_PATH/${ANDROID_ABI}" 
-                    extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH" 
-                    extraLinkerFlags="-lixwebsocket"/>
+                  <CONFIGURATION name="Debug" isDebug="1" targetName="AILiveBand"
+                    extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH"/>
+                  <CONFIGURATION name="Release" isDebug="0" targetName="AILiveBand" optimise="1"
+                    extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH"/>
                 </CONFIGURATIONS>
               </ANDROIDSTUDIO>
             </EXPORTFORMATS>
@@ -235,6 +243,16 @@ jobs:
               const std::vector<Template> TEMPLATES = {
                   {"maj",  {0,4,7}}, {"min",  {0,3,7}}, {"dim",  {0,3,6}}, {"aug",  {0,4,8}}, {"sus4", {0,5,7}}, {"maj7", {0,4,7,11}}, {"min7", {0,3,7,10}},
               };
+              // Parses "C#min7" -> root index 1, quality "min7". Handles sharps correctly.
+              int parseRoot(const juce::String& chord, juce::String& quality) {
+                  quality = juce::String();
+                  if (chord.isEmpty()) return -1;
+                  int len = (chord.length() > 1 && chord[1] == '#') ? 2 : 1;
+                  juce::String name = chord.substring(0, len);
+                  quality = chord.substring(len);
+                  for (int i = 0; i < 12; ++i) if (name == ROOTS[i]) return i;
+                  return -1;
+              }
           }
           void ChordInference::addNote(int midi) {
               if (midi <= 0) return;
@@ -248,7 +266,7 @@ jobs:
               if (recent.empty()) return "-";
               int counts[12] = {0};
               for (int n : recent) counts[((n % 12) + 12) % 12]++;
-              int bestRoot = -1, bestScore = -1; juce::String bestName;
+              int bestRoot = -1, bestScore = -1000000; juce::String bestName;
               for (int root = 0; root < 12; ++root) {
                   for (auto& t : TEMPLATES) {
                       int score = 0, outside = 0; bool inChord[12] = {false};
@@ -261,16 +279,20 @@ jobs:
               return bestRoot < 0 ? juce::String("-") : bestName;
           }
           int ChordInference::getRootNote() const {
-              juce::String chord = getChord(); if (chord == "-") return 48;
-              for (int i = 0; i < 12; ++i) { if (chord.startsWith(ROOTS[i])) return 48 + i; }
-              return 48;
+              juce::String chord = getChord();
+              if (chord == "-") return 48;
+              juce::String quality;
+              int r = parseRoot(chord, quality);
+              return r < 0 ? 48 : 48 + r;
           }
           std::vector<int> ChordInference::getChordNotes() const {
-              std::vector<int> notes; juce::String chord = getChord(); if (chord == "-") return notes;
-              int root = 60; juce::String quality = chord;
-              for (int i = 0; i < 12; ++i) {
-                  if (chord.startsWith(ROOTS[i])) { root += i; quality = chord.substring(juce::String(ROOTS[i]).length()); break; }
-              }
+              std::vector<int> notes;
+              juce::String chord = getChord();
+              if (chord == "-") return notes;
+              juce::String quality;
+              int r = parseRoot(chord, quality);
+              if (r < 0) return notes;
+              int root = 60 + r;
               notes.push_back(root);
               if (quality.contains("maj")) { notes.push_back(root+4); notes.push_back(root+7); if (quality.contains("7")) notes.push_back(root+11); }
               else if (quality.contains("min")) { notes.push_back(root+3); notes.push_back(root+7); if (quality.contains("7")) notes.push_back(root+10); }
@@ -297,6 +319,8 @@ jobs:
               void setInstrument(int channel, int programNumber);
           private:
               tsf* synth = nullptr;
+              juce::HeapBlock<float> scratch;
+              int scratchSize = 0;
           };
           EOF
           cat > Source/SoundFontSynth.cpp << 'EOF'
@@ -308,28 +332,26 @@ jobs:
           void SoundFontSynth::initialize(double sampleRate) {
               if (synth) { tsf_close(synth); synth = nullptr; }
               if (BinaryData::SoundFont_sf2Size == 0) return;
-              try {
-                  synth = tsf_load_memory(BinaryData::SoundFont_sf2, BinaryData::SoundFont_sf2Size);
-                  if (synth && sampleRate > 0) {
-                      tsf_set_output(synth, TSF_STEREO_INTERLEAVED, (int)sampleRate, 0);
-                      tsf_channel_set_presetnumber(synth, 0, 0, 0);
-                      tsf_channel_set_presetnumber(synth, 1, 32, 0);
-                      tsf_channel_set_presetnumber(synth, 2, 48, 0);
-                      tsf_channel_set_presetnumber(synth, 3, 56, 0);
-                      tsf_channel_set_presetnumber(synth, 4, 27, 0);
-                      tsf_channel_set_presetnumber(synth, 9, 0, 1);
-                  }
-              } catch (...) { synth = nullptr; }
+              synth = tsf_load_memory(BinaryData::SoundFont_sf2, BinaryData::SoundFont_sf2Size);
+              if (synth && sampleRate > 0) {
+                  tsf_set_output(synth, TSF_STEREO_INTERLEAVED, (int)sampleRate, 0);
+                  tsf_channel_set_presetnumber(synth, 0, 0, 0);
+                  tsf_channel_set_presetnumber(synth, 1, 32, 0);
+                  tsf_channel_set_presetnumber(synth, 2, 48, 0);
+                  tsf_channel_set_presetnumber(synth, 3, 56, 0);
+                  tsf_channel_set_presetnumber(synth, 4, 27, 0);
+                  tsf_channel_set_presetnumber(synth, 9, 0, 1);
+              }
           }
           void SoundFontSynth::noteOn(int channel, int midiNote, float velocity) { if (synth) tsf_channel_note_on(synth, channel, midiNote, velocity); }
           void SoundFontSynth::noteOff(int channel, int midiNote) { if (synth) tsf_channel_note_off(synth, channel, midiNote); }
           void SoundFontSynth::render(float* leftChannel, float* rightChannel, int numSamples) {
               if (synth) {
-                  juce::HeapBlock<float> interleavedBuffer(numSamples * 2);
-                  tsf_render_float(synth, interleavedBuffer.getData(), numSamples, 0);
+                  if (scratchSize < numSamples * 2) { scratch.allocate((size_t)(numSamples * 2), false); scratchSize = numSamples * 2; }
+                  tsf_render_float(synth, scratch.get(), numSamples, 0);
                   for (int i = 0; i < numSamples; ++i) {
-                      leftChannel[i] = interleavedBuffer[i * 2];
-                      if (rightChannel) rightChannel[i] = interleavedBuffer[i * 2 + 1];
+                      leftChannel[i] = scratch[i * 2];
+                      if (rightChannel) rightChannel[i] = scratch[i * 2 + 1];
                   }
               } else {
                   juce::FloatVectorOperations::clear(leftChannel, numSamples);
@@ -339,13 +361,17 @@ jobs:
           void SoundFontSynth::setInstrument(int channel, int programNumber) { if (synth) tsf_channel_set_presetnumber(synth, channel, programNumber, 0); }
           EOF
 
-          # ── Arranger ──
+          # ── Arranger (IXWebSocket hidden behind a forward declaration so Windows
+          #    winsock headers never clash with JUCE's windows.h) ──
           cat > Source/Arranger.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
           #include "ChordInference.h"
           #include "SoundFontSynth.h"
-          #include <ixwebsocket/IXWebSocket.h>
+          #include <atomic>
+          #include <memory>
+
+          namespace ix { class WebSocket; }
 
           class Arranger : public juce::Timer {
           public:
@@ -362,56 +388,64 @@ jobs:
               ChordInference& chordEngine;
               SoundFontSynth& synth;
 
-              ix::WebSocket webSocket;
+              std::unique_ptr<ix::WebSocket> webSocket;
               std::atomic<bool> connected { false };
-              juce::String aiResponse;
-              juce::CriticalSection responseLock;
 
               JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(Arranger)
           };
           EOF
           cat > Source/Arranger.cpp << 'EOF'
+          // IXWebSocket MUST be included before JuceHeader.h (winsock2.h before windows.h).
+          #include <ixwebsocket/IXNetSystem.h>
+          #include <ixwebsocket/IXWebSocket.h>
           #include "Arranger.h"
           #include "Config.h"
 
-          Arranger::Arranger(ChordInference& ci, SoundFontSynth& s) : chordEngine(ci), synth(s) {}
-          Arranger::~Arranger() { stop(); }
+          Arranger::Arranger(ChordInference& ci, SoundFontSynth& s) : chordEngine(ci), synth(s) {
+              ix::initNetSystem(); // required on Windows, harmless elsewhere
+              webSocket = std::make_unique<ix::WebSocket>();
+          }
+
+          Arranger::~Arranger() {
+              stop();
+              webSocket.reset();
+              ix::uninitNetSystem();
+          }
 
           void Arranger::start() {
-              webSocket.setUrl(AI_LIVE_BAND_SERVER_URL);
+              webSocket->setUrl(AI_LIVE_BAND_SERVER_URL);
+              webSocket->setPingInterval(30);
 
-              webSocket.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
+              webSocket->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
                   if (msg->type == ix::WebSocketMessageType::Open) {
                       connected.store(true);
                   } else if (msg->type == ix::WebSocketMessageType::Close) {
                       connected.store(false);
                   } else if (msg->type == ix::WebSocketMessageType::Message) {
-                      juce::MessageManager::callAsync([this, payload = msg->str] {
-                          DBG("Received from server: " << payload);
-                      });
+                      DBG("Received from server: " << juce::String(msg->str));
                   } else if (msg->type == ix::WebSocketMessageType::Error) {
                       connected.store(false);
-                      DBG("WebSocket Error: " << msg->errorInfo.reason);
+                      DBG("WebSocket Error: " << juce::String(msg->errorInfo.reason));
                   }
               });
 
-              webSocket.start();
+              webSocket->start();
               startTimerHz(30);
           }
 
           void Arranger::stop() {
-              webSocket.stop();
+              if (webSocket) webSocket->stop();
               stopTimer();
               connected.store(false);
           }
 
           void Arranger::sendToServer(int midiNote, float energy, float pitchSpeed, juce::String chord) {
-              if (!connected.load()) return;
+              if (!connected.load() || !webSocket) return;
               juce::String message = juce::String(midiNote) + "," +
                                      juce::String(energy) + "," +
                                      juce::String(pitchSpeed) + "," +
                                      chord;
-              webSocket.send(message.toStdString());
+              webSocket->send(message.toStdString());
           }
 
           void Arranger::timerCallback() {}
@@ -448,7 +482,6 @@ jobs:
               ChordInference chordInference;
               SoundFontSynth synth;
               std::unique_ptr<Arranger> arranger;
-              std::unique_ptr<juce::AudioDeviceSelectorComponent> deviceSelector;
               juce::Label noteLabel, chordLabel, stateLabel;
               juce::TextButton startButton { "Start" };
               juce::TextButton testButton { "Test AI" };
@@ -489,10 +522,10 @@ jobs:
               };
               testButton.onClick = [this] {
                   if (!arranger || !arranger->isConnected()) return;
-                  juce::Timer::callAfterDelay(0, [this] { arranger->sendToServer(60, 0.8f, 0.1f, "Cmaj"); });
-                  juce::Timer::callAfterDelay(200, [this] { arranger->sendToServer(64, 0.8f, 0.1f, "Cmaj"); });
-                  juce::Timer::callAfterDelay(400, [this] { arranger->sendToServer(67, 0.8f, 0.1f, "Cmaj"); });
-                  juce::Timer::callAfterDelay(600, [this] { arranger->sendToServer(60, 0.8f, 0.1f, "Cmaj"); });
+                  juce::Timer::callAfterDelay(0, [this] { if (arranger) arranger->sendToServer(60, 0.8f, 0.1f, "Cmaj"); });
+                  juce::Timer::callAfterDelay(200, [this] { if (arranger) arranger->sendToServer(64, 0.8f, 0.1f, "Cmaj"); });
+                  juce::Timer::callAfterDelay(400, [this] { if (arranger) arranger->sendToServer(67, 0.8f, 0.1f, "Cmaj"); });
+                  juce::Timer::callAfterDelay(600, [this] { if (arranger) arranger->sendToServer(60, 0.8f, 0.1f, "Cmaj"); });
               };
               settingsButton.onClick = [this] { showAudioSettings(); };
               setSize(700, 600);
@@ -500,18 +533,17 @@ jobs:
           }
           MainComponent::~MainComponent() { stopTimer(); stopAudio(); }
           void MainComponent::showAudioSettings() {
-              if (!deviceSelector) {
-                  deviceSelector = std::make_unique<juce::AudioDeviceSelectorComponent>(deviceManager, 1, 2, 2, 2, false, false, true, false);
-                  deviceSelector->setSize(500, 400);
-                  juce::DialogWindow::LaunchOptions options;
-                  options.content.setNonOwned(deviceSelector.get());
-                  options.dialogTitle = "Audio Routing (Mic & Speaker)";
-                  options.dialogBackgroundColour = juce::Colours::darkgrey;
-                  options.escapeKeyTriggersCloseButton = true;
-                  options.useNativeTitleBar = true;
-                  options.resizable = false;
-                  options.launchAsync();
-              }
+              // A fresh selector each time, so the dialog can be opened again after it is closed.
+              auto* selector = new juce::AudioDeviceSelectorComponent(deviceManager, 1, 2, 2, 2, false, false, true, false);
+              selector->setSize(500, 400);
+              juce::DialogWindow::LaunchOptions options;
+              options.content.setOwned(selector);
+              options.dialogTitle = "Audio Routing (Mic & Speaker)";
+              options.dialogBackgroundColour = juce::Colours::darkgrey;
+              options.escapeKeyTriggersCloseButton = true;
+              options.useNativeTitleBar = true;
+              options.resizable = false;
+              options.launchAsync();
           }
           void MainComponent::startAudio() {
               if (deviceManager.getCurrentAudioDevice()) return;
@@ -524,8 +556,9 @@ jobs:
               if (arranger) arranger->start();
           }
           void MainComponent::stopAudio() {
-              if (arranger) { arranger->stop(); arranger.reset(); }
+              // Stop audio first so the callback can no longer touch the arranger.
               if (deviceManager.getCurrentAudioDevice()) { deviceManager.removeAudioCallback(this); deviceManager.closeAudioDevice(); }
+              if (arranger) { arranger->stop(); arranger.reset(); }
           }
           void MainComponent::paint(juce::Graphics& g) {
               g.fillAll(juce::Colour::fromRGB(10, 12, 18));
@@ -557,7 +590,7 @@ jobs:
               if (numInputChannels > 0 && inputChannelData[0] && pitchDetector) {
                   float rms = 0.0f;
                   for (int i = 0; i < numSamples; ++i) rms += inputChannelData[0][i] * inputChannelData[0][i];
-                  rms = std::sqrt(rms / numSamples);
+                  rms = std::sqrt(rms / (float)numSamples);
                   float confidence = 0.0f;
                   float freq = pitchDetector->detect(inputChannelData[0], numSamples, confidence);
                   currentConfidence.store(confidence);
@@ -567,10 +600,16 @@ jobs:
                       pitchSpeed.store(std::abs(freq - lastPitch) / 100.0f);
                       lastPitch = freq;
                       chordInference.addNote(PitchDetector::freqToMidi(freq));
+                  } else {
+                      currentFreq.store(0.0f);
                   }
                   if (arranger) arranger->sendToServer(PitchDetector::freqToMidi(freq), rms, pitchSpeed.load(), chordInference.getChord());
               }
-              if (numOutputChannels >= 2) synth.render(outputChannelData[0], outputChannelData[1], numSamples);
+              // Always fill every output channel (never leave garbage in the buffer).
+              if (numOutputChannels >= 1 && outputChannelData[0])
+                  synth.render(outputChannelData[0], (numOutputChannels >= 2 ? outputChannelData[1] : nullptr), numSamples);
+              for (int ch = 2; ch < numOutputChannels; ++ch)
+                  if (outputChannelData[ch]) juce::FloatVectorOperations::clear(outputChannelData[ch], numSamples);
           }
           void MainComponent::timerCallback() {
               float f = currentFreq.load(); float conf = currentConfidence.load(); float energy = currentEnergy.load();
@@ -619,7 +658,11 @@ jobs:
                       setResizable(true, true);
                       #endif
                       setContentOwned(new MainComponent(), true);
+                      #if JUCE_ANDROID
+                      setFullScreen(true);
+                      #else
                       centreWithSize(getWidth(), getHeight());
+                      #endif
                       setVisible(true);
                   }
                   void closeButtonPressed() override { JUCEApplication::getInstance()->systemRequestedQuit(); }
@@ -633,6 +676,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: source
+          if-no-files-found: error
           path: |
             CMakeLists.txt
             AILiveBand.jucer
@@ -644,6 +688,7 @@ jobs:
   build-linux:
     needs: scaffold
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/download-artifact@v4
         with: { name: source }
@@ -666,17 +711,25 @@ jobs:
             libasound2-dev libjack-jackd2-dev ladspa-sdk libcurl4-openssl-dev \
             libfreetype-dev libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev \
             libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libxi-dev \
-            libwebkit2gtk-4.1-dev libglu1-mesa-dev mesa-common-dev libegl-dev
+            libglu1-mesa-dev mesa-common-dev libegl-dev
 
       - name: Configure & Build
         run: |
-          rm -rf build && cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          rm -rf build
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release
 
+      - name: Package Linux app
+        run: |
+          ls -la build/AILiveBand_artefacts/Release/
+          tar -czf AILiveBand-linux.tar.gz -C build/AILiveBand_artefacts/Release "AI Live Band"
+
       - name: Upload Linux app
-        if: success()
         uses: actions/upload-artifact@v4
-        with: { name: AILiveBand-linux, path: build/AILiveBand_artefacts/Release/AI\ Live\ Band }
+        with:
+          name: AILiveBand-linux
+          path: AILiveBand-linux.tar.gz
+          if-no-files-found: error
 
   # ─────────────────────────────────────────────
   # 2. WINDOWS
@@ -684,6 +737,7 @@ jobs:
   build-windows:
     needs: scaffold
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/download-artifact@v4
         with: { name: source }
@@ -708,9 +762,11 @@ jobs:
           cmake --build build --config Release
 
       - name: Upload Windows app
-        if: success()
         uses: actions/upload-artifact@v4
-        with: { name: AILiveBand-windows, path: build/AILiveBand_artefacts/Release/AI\ Live\ Band.exe }
+        with:
+          name: AILiveBand-windows
+          path: build/AILiveBand_artefacts/Release/AI Live Band.exe
+          if-no-files-found: error
 
   # ─────────────────────────────────────────────
   # 3. MACOS
@@ -718,6 +774,7 @@ jobs:
   build-macos:
     needs: scaffold
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/download-artifact@v4
         with: { name: source }
@@ -734,17 +791,24 @@ jobs:
         run: git clone --branch ${{ env.JUCE_VERSION }} --depth 1 https://github.com/juce-framework/JUCE.git
 
       - name: Install Ninja
-        run: brew install ninja
+        run: brew install ninja || true
 
       - name: Configure & Build
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
           cmake --build build --config Release
 
+      - name: Package macOS app
+        run: |
+          ls -la build/AILiveBand_artefacts/Release/
+          tar -czf AILiveBand-macos.tar.gz -C build/AILiveBand_artefacts/Release "AI Live Band.app"
+
       - name: Upload macOS app
-        if: success()
         uses: actions/upload-artifact@v4
-        with: { name: AILiveBand-macos, path: build/AILiveBand_artefacts/Release/AI\ Live\ Band.app }
+        with:
+          name: AILiveBand-macos
+          path: AILiveBand-macos.tar.gz
+          if-no-files-found: error
 
   # ─────────────────────────────────────────────
   # 4. ANDROID
@@ -752,18 +816,16 @@ jobs:
   build-android:
     needs: scaffold
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/download-artifact@v4
         with: { name: source }
 
-      # ── CACHE GRADLE WRAPPER (Prevents re-downloading on transient 504s) ──
       - name: Cache Gradle Wrapper
         uses: actions/cache@v4
         with:
           path: ~/.gradle/wrapper/dists
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
+          key: ${{ runner.os }}-gradle-wrapper-v1
 
       - name: Cache JUCE
         id: cache-juce
@@ -778,14 +840,16 @@ jobs:
 
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
-      - uses: android-actions/setup-android@v4
-        with: { packages: '' }
 
-      - name: Install Android NDK
+      # The ubuntu runner already ships the Android SDK + cmdline-tools, so no extra setup action is needed.
+      - name: Install Android SDK components
         run: |
-          yes | sdkmanager --licenses --sdk_root=$ANDROID_HOME || true
-          sdkmanager "ndk;${{ env.ANDROID_NDK_VERSION }}" --sdk_root=$ANDROID_HOME
-          
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          SDKMANAGER="$(command -v sdkmanager || ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n 1)"
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses --sdk_root="$ANDROID_HOME" > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "ndk;$ANDROID_NDK_VERSION" "platforms;android-34" "build-tools;34.0.0"
+
       - name: Install Host Build Dependencies
         run: |
           sudo apt-get update
@@ -794,9 +858,123 @@ jobs:
             libcurl4-openssl-dev \
             libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev \
             libfreetype6-dev libfontconfig1-dev libasound2-dev libjack-jackd2-dev \
-            ladspa-sdk libwebkit2gtk-4.1-dev libglu1-mesa-dev mesa-common-dev libegl-dev
+            ladspa-sdk libwebkit2gtk-4.1-dev libgtk-3-dev libglu1-mesa-dev mesa-common-dev libegl-dev
 
-      # ── RETRY PREFETCH (Handles transient 504s with retries) ──
+      - name: Pre-build IXWebSocket for Android (all ABIs)
+        run: |
+          git clone --depth 1 --branch v11.4.4 https://github.com/machinezone/IXWebSocket.git ixwebsocket-src
+          mkdir -p ixwebsocket-android/libs ixwebsocket-android/include
+
+          NDK_TOOLCHAIN="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/build/cmake/android.toolchain.cmake"
+          test -f "$NDK_TOOLCHAIN" || (echo "::error::NDK toolchain not found at $NDK_TOOLCHAIN" && exit 1)
+
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            cmake -S ixwebsocket-src -B "ixwebsocket-src/build-${ABI}" \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
+              -DANDROID_ABI="$ABI" \
+              -DANDROID_PLATFORM=android-24 \
+              -DUSE_TLS=OFF \
+              -DUSE_ZLIB=OFF \
+              -DUSE_TEST=OFF \
+              -DUSE_WS=OFF \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DCMAKE_CXX_STANDARD=17 \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build "ixwebsocket-src/build-${ABI}" --target ixwebsocket -j"$(nproc)"
+
+            mkdir -p "ixwebsocket-android/libs/${ABI}"
+            find "ixwebsocket-src/build-${ABI}" -name "libixwebsocket.a" -exec cp {} "ixwebsocket-android/libs/${ABI}/" \;
+            test -f "ixwebsocket-android/libs/${ABI}/libixwebsocket.a" || (echo "::error::libixwebsocket.a missing for ${ABI}" && exit 1)
+          done
+
+          cp -r ixwebsocket-src/ixwebsocket ixwebsocket-android/include/
+          echo "IXWebSocket static libraries built:"
+          find ixwebsocket-android -name "*.a"
+
+      - name: Build Projucer CLI
+        run: |
+          cd JUCE/extras/Projucer/Builds/LinuxMakefile
+          make -j"$(nproc)" CONFIG=Release
+          echo "$GITHUB_WORKSPACE/JUCE/extras/Projucer/Builds/LinuxMakefile/build" >> $GITHUB_PATH
+
+      - name: Generate Android Gradle Project via Projucer
+        run: |
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+
+          # 1. Substitute the include path in the .jucer file
+          sed -i "s|IXWEBSOCKET_INCLUDE_PATH|$GITHUB_WORKSPACE/ixwebsocket-android/include|g" AILiveBand.jucer
+
+          # 2. Set Projucer paths and resave
+          Projucer --set-global-search-path linux defaultJuceModulePath "$GITHUB_WORKSPACE/JUCE/modules"
+          Projucer --set-global-search-path linux androidSDKPath "$ANDROID_HOME"
+          Projucer --resave AILiveBand.jucer
+
+          echo "Verifying generated Android project..."
+          ls -la Builds/Android/ || (echo "::error::Builds/Android not found" && exit 1)
+
+          # ── PATCH 1: link IXWebSocket (static) + add its headers, inserted AFTER project() ──
+          CMAKE_FILE="Builds/Android/app/CMakeLists.txt"
+          if [ -f "$CMAKE_FILE" ]; then
+            echo "Patching $CMAKE_FILE ..."
+            python3 - "$CMAKE_FILE" "$GITHUB_WORKSPACE" <<'PY'
+          import re, sys
+          path, ws = sys.argv[1], sys.argv[2]
+          lines = open(path).read().split("\n")
+          lines = [l for l in lines if not re.search(r"target_link_libraries.*AILiveBand", l)]
+          abi_var = "$" + "{ANDROID_ABI}"
+          inject = [
+              'include_directories("%s/ixwebsocket-android/include")' % ws,
+              'link_libraries("%s/ixwebsocket-android/libs/%s/libixwebsocket.a")' % (ws, abi_var),
+          ]
+          idx = None
+          for i, l in enumerate(lines):
+              if re.match(r"^\s*project\s*\(", l, re.I):
+                  idx = i
+                  break
+          if idx is None:
+              for i, l in enumerate(lines):
+                  if re.match(r"^\s*cmake_minimum_required\s*\(", l, re.I):
+                      idx = i
+                      break
+          if idx is None:
+              lines = inject + lines
+          else:
+              lines = lines[:idx + 1] + inject + lines[idx + 1:]
+          open(path, "w").write("\n".join(lines))
+          PY
+            grep -n "ixwebsocket" "$CMAKE_FILE" || (echo "::error::CMake patch did not apply" && exit 1)
+          else
+            echo "::error::$CMAKE_FILE not found" && exit 1
+          fi
+
+          # ── PATCH 2: manifest permissions (mic + internet) and cleartext ws:// ──
+          MANIFEST_PATH="Builds/Android/app/src/main/AndroidManifest.xml"
+          for PERM in RECORD_AUDIO INTERNET; do
+            if ! grep -q "android.permission.$PERM" "$MANIFEST_PATH"; then
+              echo "$PERM missing from manifest, injecting..."
+              sed -i "/<application/i \    <uses-permission android:name=\"android.permission.$PERM\" />" "$MANIFEST_PATH"
+            fi
+            grep -q "android.permission.$PERM" "$MANIFEST_PATH" \
+              && echo "✅ $PERM permission verified in manifest." \
+              || (echo "::error::$PERM permission missing from manifest" && exit 1)
+          done
+          if ! grep -q "usesCleartextTraffic" "$MANIFEST_PATH"; then
+            sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MANIFEST_PATH"
+          fi
+
+          # ── PATCH 3: Gradle fixes ──
+          GRADLE_FILE="Builds/Android/app/build.gradle"
+          if [ -f "$GRADLE_FILE" ]; then
+            sed -i '/DANDROID_STL=c++_shared/d' "$GRADLE_FILE"
+            sed -i '/CMAKE_MAKE_PROGRAM/d' "$GRADLE_FILE"
+            if ! grep -q ndkVersion "$GRADLE_FILE"; then
+              sed -i "0,/^android {/s//android {\n    ndkVersion \"$ANDROID_NDK_VERSION\"/" "$GRADLE_FILE"
+            fi
+          fi
+
+      # (moved here: the wrapper properties only exist AFTER Projucer generated the project)
       - name: Prefetch Gradle Distribution with Retries
         run: |
           PROPS_FILE="Builds/Android/gradle/wrapper/gradle-wrapper.properties"
@@ -804,14 +982,22 @@ jobs:
             URL=$(sed -n 's/^distributionUrl=//p' "$PROPS_FILE" | sed 's/\\//g')
             ZIP_NAME=${URL##*/}
             DIST_NAME=${ZIP_NAME%.zip}
-            HASH=$(python3 -c "import hashlib; n=int.from_bytes(hashlib.md5('$URL'.encode()).digest(),'big'); d='0123456789abcdefghijklmnopqrstuvwxyz'; s='';
-          while n: n,r=divmod(n,36); s=d[r]+s
-          print(s)")
+            python3 - "$URL" > gradle_hash.txt <<'PY'
+          import hashlib, sys
+          n = int.from_bytes(hashlib.md5(sys.argv[1].encode()).digest(), "big")
+          d = "0123456789abcdefghijklmnopqrstuvwxyz"
+          s = ""
+          while n:
+              n, r = divmod(n, 36)
+              s = d[r] + s
+          print(s)
+          PY
+            HASH=$(cat gradle_hash.txt)
             DIST_DIR="$HOME/.gradle/wrapper/dists/$DIST_NAME/$HASH"
             mkdir -p "$DIST_DIR"
-            
-            if [ ! -f "$DIST_DIR/$ZIP_NAME" ]; then
-              for i in {1..8}; do
+
+            if [ ! -f "$DIST_DIR/$ZIP_NAME" ] && [ ! -d "$DIST_DIR/${DIST_NAME%-bin}" ]; then
+              for i in 1 2 3 4 5 6 7 8; do
                 if curl -fsSL --connect-timeout 15 --max-time 300 -o "$DIST_DIR/$ZIP_NAME.part" "$URL" && \
                    unzip -tq "$DIST_DIR/$ZIP_NAME.part" > /dev/null 2>&1; then
                   mv "$DIST_DIR/$ZIP_NAME.part" "$DIST_DIR/$ZIP_NAME"
@@ -823,115 +1009,27 @@ jobs:
                 sleep 15
               done
             else
-              echo "✅ Gradle distribution already cached."
+              echo "✅ Gradle distribution already present."
             fi
-          fi
-
-      - name: Pre-build IXWebSocket for Android (all ABIs)
-        run: |
-          git clone --depth 1 https://github.com/machinezone/IXWebSocket.git ixwebsocket-src
-          mkdir -p ixwebsocket-android/libs ixwebsocket-android/include
-          
-          NDK_TOOLCHAIN="$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}/build/cmake/android.toolchain.cmake"
-          
-          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
-            mkdir -p "ixwebsocket-src/build-${ABI}"
-            cmake -S ixwebsocket-src -B "ixwebsocket-src/build-${ABI}" \
-              -DCMAKE_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
-              -DANDROID_ABI="$ABI" \
-              -DANDROID_PLATFORM=android-21 \
-              -DANDROID_STL=c++_shared \
-              -DUSE_TLS=OFF \
-              -DBUILD_SHARED_LIBS=OFF \
-              -DCMAKE_CXX_STANDARD=17 \
-              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-              -DCMAKE_BUILD_TYPE=Release
-            cmake --build "ixwebsocket-src/build-${ABI}" --target ixwebsocket -j$(nproc)
-            
-            mkdir -p "ixwebsocket-android/libs/${ABI}"
-            find "ixwebsocket-src/build-${ABI}" -name "libixwebsocket.a" -exec cp {} "ixwebsocket-android/libs/${ABI}/" \;
-          done
-          
-          cp -r ixwebsocket-src/ixwebsocket ixwebsocket-android/include/
-          
-          echo "IXWebSocket static libraries built:"
-          find ixwebsocket-android -name "*.a" -o -name "IXWebSocket.h"
-
-      - name: Build Projucer CLI
-        run: |
-          cd JUCE/extras/Projucer/Builds/LinuxMakefile
-          make -j$(nproc)
-          echo "$GITHUB_WORKSPACE/JUCE/extras/Projucer/Builds/LinuxMakefile/build" >> $GITHUB_PATH
-
-      - name: Generate Android Gradle Project via Projucer
-        run: |
-          export ANDROID_SDK_ROOT=$ANDROID_HOME
-          
-          # 1. Substitute paths in the .jucer file
-          sed -i "s|IXWEBSOCKET_LIB_PATH|$GITHUB_WORKSPACE/ixwebsocket-android/libs|g" AILiveBand.jucer
-          sed -i "s|IXWEBSOCKET_INCLUDE_PATH|$GITHUB_WORKSPACE/ixwebsocket-android/include|g" AILiveBand.jucer
-          
-          # 2. Set Projucer paths and resave
-          Projucer --set-global-search-path linux defaultJuceModulePath $GITHUB_WORKSPACE/JUCE/modules
-          Projucer --set-global-search-path linux androidSDKPath $ANDROID_HOME
-          Projucer --resave AILiveBand.jucer
-          
-          echo "Verifying generated Android project..."
-          ls -la Builds/Android/ || (echo "::error::Builds/Android not found" && exit 1)
-          
-          # 3. Inject NDK version
-          echo "android.ndkVersion=${{ env.ANDROID_NDK_VERSION }}" >> Builds/Android/gradle.properties
-          
-          # ── SAFETY NET 1: Remove invalid target_link_libraries and use global link_libraries ──
-          CMAKE_FILE="Builds/Android/app/CMakeLists.txt"
-          if [ -f "$CMAKE_FILE" ]; then
-            echo "✅ Patching CMakeLists.txt to remove invalid target links and apply global links..."
-            
-            # CRITICAL FIX: Delete the lines causing the "target AILiveBand not built by this project" error
-            sed -i '/target_link_libraries.*AILiveBand/d' "$CMAKE_FILE"
-            
-            # Force the C++ shared STL globally at the top of the file
-            sed -i "1i set(ANDROID_STL c++_shared)" "$CMAKE_FILE"
-            
-            # Add include directory and link_libraries globally right after project() to bypass target name issues
-            sed -i "/project/a include_directories($GITHUB_WORKSPACE/ixwebsocket-android/include)" "$CMAKE_FILE"
-            sed -i "/project/a link_libraries(\"$GITHUB_WORKSPACE/ixwebsocket-android/libs/\${ANDROID_ABI}/libixwebsocket.a\")" "$CMAKE_FILE"
-          fi
-
-          # ── SAFETY NET 2: Ensure RECORD_AUDIO permission is present ──
-          MANIFEST_PATH="Builds/Android/app/src/main/AndroidManifest.xml"
-          if ! grep -q "android.permission.RECORD_AUDIO" "$MANIFEST_PATH"; then
-            echo "RECORD_AUDIO missing from manifest, injecting manually..."
-            sed -i '/<application/i \    <uses-permission android:name="android.permission.RECORD_AUDIO" />' "$MANIFEST_PATH"
-          fi
-          
-          grep -q "android.permission.RECORD_AUDIO" "$MANIFEST_PATH" \
-            && echo "✅ RECORD_AUDIO permission verified in manifest." \
-            || (echo "::error::RECORD_AUDIO permission missing from manifest" && exit 1)
-
-          # ── SAFETY NET 3 & 4: Fix Gradle arguments placement ──
-          GRADLE_FILE="Builds/Android/app/build.gradle"
-          if [ -f "$GRADLE_FILE" ]; then
-            echo "✅ Patching build.gradle to remove invalid CMake arguments..."
-            sed -i '/DANDROID_STL=c++_shared/d' "$GRADLE_FILE"
-            sed -i '/CMAKE_MAKE_PROGRAM/d' "$GRADLE_FILE"
           fi
 
       - name: Build APK with Gradle
         run: |
           cd Builds/Android
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Verify IXWebSocket is linked into the APK
         run: |
-          APK_PATH=$(find Builds/Android -name "*.apk" | head -n 1)
+          APK_PATH=$(find Builds/Android -name "*.apk" -type f | head -n 1)
+          test -n "$APK_PATH" || (echo "::error::No APK found" && exit 1)
+          mkdir -p apk_check
           unzip -o "$APK_PATH" "lib/arm64-v8a/*.so" -d apk_check
-          
-          if nm -D apk_check/lib/arm64-v8a/*.so 2>/dev/null | c++filt | grep -q "ix::WebSocket"; then
-            echo "✅ IXWebSocket symbols found. Library is linked."
+          # Symbols may be hidden/stripped, so look for a string literal that only IXWebSocket contains.
+          if grep -aq "Sec-WebSocket-Key" apk_check/lib/arm64-v8a/*.so; then
+            echo "✅ IXWebSocket code found. Library is linked."
           else
-            echo "::error::IXWebSocket symbols NOT found. The library was not linked correctly."
+            echo "::error::IXWebSocket NOT found in the native library."
             exit 1
           fi
 
@@ -950,3 +1048,4 @@ jobs:
         with:
           name: AILiveBand-android
           path: ./AILiveBand.apk
+          if-no-files-found: error
