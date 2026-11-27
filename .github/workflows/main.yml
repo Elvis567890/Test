@@ -20,84 +20,111 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Download SoundFont and TinySoundFont
-        env:
-          GM_SOUNDFONT_URL: ${{ vars.GM_SOUNDFONT_URL }}
         run: |
           set -euo pipefail
 
-          if [ -z "${GM_SOUNDFONT_URL:-}" ]; then
-            echo "::error::Repository variable GM_SOUNDFONT_URL is not set."
-            echo "::error::Set GM_SOUNDFONT_URL to a direct HTTPS URL for a General MIDI SF2 file under 20 MB."
+          TSF_URLS="https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h https://raw.githubusercontent.com/schellingb/TinySoundFont/HEAD/tsf.h https://raw.githubusercontent.com/schellingb/TinySoundFont/main/tsf.h"
+          SF_URL="https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2"
+
+          got_tsf=0
+          for url in $TSF_URLS; do
+            if curl -fsSL --retry 3 --retry-delay 3 -o tsf.h "$url"; then
+              echo "Downloaded tsf.h from $url"
+              got_tsf=1
+              break
+            fi
+            echo "Failed to download tsf.h from $url"
+          done
+
+          if [ "$got_tsf" != "1" ]; then
+            echo "::error::Could not download tsf.h from any TinySoundFont URL."
             exit 1
           fi
 
-          download() {
-            out="$1"; shift
-            for url in "$@"; do
-              if curl -fsSL --retry 3 --retry-delay 3 -o "$out" "$url"; then
-                echo "Downloaded $out from $url"; return 0
-              fi
-              echo "Failed: $url"
-            done
-            return 1
-          }
+          if ! grep -q "TSF_IMPLEMENTATION" tsf.h; then
+            echo "::error::Downloaded tsf.h is invalid (missing TSF_IMPLEMENTATION)."
+            exit 1
+          fi
 
-          download tsf.h \
-            https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h \
-            https://raw.githubusercontent.com/schellingb/TinySoundFont/HEAD/tsf.h \
-            https://raw.githubusercontent.com/schellingb/TinySoundFont/main/tsf.h \
-            || { echo "::error::Could not download tsf.h"; exit 1; }
+          cat > verify_sf2.py <<'PY'
+          import os
+          import struct
+          import sys
 
-          grep -q TSF_IMPLEMENTATION tsf.h || { echo "::error::tsf.h is not valid"; exit 1; }
+          path = sys.argv[1]
+          max_bytes = 20 * 1024 * 1024
 
-          verify_sf2() {
-            python3 - "$1" <<'PY'
-          import os, struct, sys
-          try:
-              path = sys.argv[1]
-              max_bytes = 20 * 1024 * 1024
-              size = os.path.getsize(path)
-              if size >= max_bytes:
-                  print(f"SoundFont size {size} bytes exceeds 20 MB limit ({max_bytes} bytes)")
-                  sys.exit(1)
+          if not os.path.isfile(path):
+              print(f"SoundFont file does not exist: {path}")
+              sys.exit(1)
 
-              data = open(path, 'rb').read()
-              if len(data) < 12 or data[:4] != b'RIFF' or data[8:12] != b'sfbk':
-                  print("Not an SF2"); sys.exit(1)
-              idx = data.find(b'LIST')
-              while idx >= 0:
-                  if data[idx+8:idx+12] == b'pdta': break
-                  idx = data.find(b'LIST', idx + 12)
-              if idx < 0: print("No pdta"); sys.exit(1)
-              pos = idx + 12
-              end = idx + 8 + struct.unpack('<I', data[idx+4:idx+8])[0]
-              presets = set(); has_drum = False
-              while pos < end:
-                  ct = data[pos:pos+4]
-                  cs = struct.unpack('<I', data[pos+4:pos+8])[0]
-                  if ct == b'phdr':
-                      n = (cs // 38) - 1
-                      phdr = data[pos+8:pos+8+cs]
-                      for i in range(n):
-                          o = i * 38
-                          preset = struct.unpack('<H', phdr[o+20:o+22])[0]
-                          bank   = struct.unpack('<H', phdr[o+22:o+24])[0]
-                          if bank == 0 and preset < 128: presets.add(preset)
-                          if bank == 128: has_drum = True
-                  pos += 8 + cs
-              print(f"GM presets: {len(presets)}/128, drums: {has_drum}, size: {size} bytes")
-              sys.exit(0 if (len(presets) >= 128 and has_drum) else 1)
-          except SystemExit: raise
-          except Exception as e: print(f"Parse error: {e}"); sys.exit(1)
+          size = os.path.getsize(path)
+          if size <= 0 or size >= max_bytes:
+              print(f"SoundFont size {size} bytes is invalid; must be > 0 and under {max_bytes} bytes.")
+              sys.exit(1)
+
+          with open(path, "rb") as f:
+              data = f.read()
+
+          if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"sfbk":
+              print("File is not a valid RIFF/sfbk SF2 SoundFont.")
+              sys.exit(1)
+
+          idx = data.find(b"LIST")
+          pdta_offset = -1
+          while idx >= 0 and idx + 12 <= len(data):
+              if data[idx + 8:idx + 12] == b"pdta":
+                  pdta_offset = idx
+                  break
+              chunk_len = struct.unpack("<I", data[idx + 4:idx + 8])[0]
+              idx = data.find(b"LIST", idx + 8 + chunk_len)
+
+          if pdta_offset < 0:
+              print("SF2 file missing pdta chunk.")
+              sys.exit(1)
+
+          pos = pdta_offset + 12
+          pdta_size = struct.unpack("<I", data[pdta_offset + 4:pdta_offset + 8])[0]
+          end = min(len(data), pdta_offset + 8 + pdta_size)
+
+          presets = set()
+          has_drums = False
+
+          while pos + 8 <= end:
+              ct = data[pos:pos + 4]
+              cs = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+              payload_start = pos + 8
+              payload_end = min(end, payload_start + cs)
+              if ct == b"phdr" and (payload_end - payload_start) >= 38:
+                  n = ((payload_end - payload_start) // 38) - 1
+                  phdr = data[payload_start:payload_end]
+                  for i in range(max(0, n)):
+                      o = i * 38
+                      preset = struct.unpack("<H", phdr[o + 20:o + 22])[0]
+                      bank = struct.unpack("<H", phdr[o + 22:o + 24])[0]
+                      if bank == 0 and preset < 128:
+                          presets.add(preset)
+                      if bank == 128:
+                          has_drums = True
+              pos = payload_start + cs + (cs & 1)
+
+          print(f"GM presets: {len(presets)}/128, drums: {has_drums}, size: {size} bytes")
+          if len(presets) < 128 or not has_drums:
+              print("SoundFont validation failed: requires all 128 GM presets (bank 0) and drums (bank 128).")
+              sys.exit(1)
           PY
-          }
 
-          curl -fsSL --retry 3 --retry-delay 3 -o SoundFont.sf2 "$GM_SOUNDFONT_URL" \
-            || { echo "::error::Could not download SoundFont from GM_SOUNDFONT_URL"; exit 1; }
+          if ! curl -fsSL --retry 3 --retry-delay 3 -o SoundFont.sf2 "$SF_URL"; then
+            echo "::error::Failed to download SoundFont from $SF_URL"
+            exit 1
+          fi
 
-          verify_sf2 SoundFont.sf2 \
-            || { echo "::error::SoundFont from GM_SOUNDFONT_URL failed validation (must be <20MB with all 128 GM presets and drums)."; exit 1; }
-          echo "OK: Validated GM SoundFont under 20 MB."
+          if ! python3 verify_sf2.py SoundFont.sf2; then
+            echo "::error::SoundFont failed validation (must be under 20 MB with all 128 GM presets and drums)."
+            exit 1
+          fi
+
+          echo "OK: Downloaded and verified SoundFont.sf2 under 20 MB."
 
       - name: Create project files
         run: |
@@ -105,6 +132,14 @@ jobs:
           mkdir -p Source
           mv tsf.h Source/tsf.h
           mv SoundFont.sf2 Source/SoundFont.sf2
+
+          # ── Config.h (hardcoded once for all build jobs) ──
+          cat > Source/Config.h << 'EOF'
+          #pragma once
+          #define AI_LIVE_BAND_SERVER_URL "ws://13.140.90.83:8765"
+          #define AI_LIVE_BAND_ACCESS_TOKEN "ai-live-band-2024"
+          #define AI_LIVE_BAND_SOUNDFONT_URL "https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2"
+          EOF
 
           # ── CMakeLists.txt (DESKTOP) ──
           cat > CMakeLists.txt << 'EOF'
@@ -257,12 +292,13 @@ jobs:
           static const char* const GM_KEYS[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
           EOF
 
-          # ── PitchDetector (worker thread YIN with RMS gate) ──
+          # ── PitchDetector (64-bit non-overflowing ring counters + adjustable voiced threshold) ──
           cat > Source/PitchDetector.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
           #include <array>
           #include <atomic>
+          #include <cstdint>
 
           class PitchDetector : private juce::Thread {
           public:
@@ -275,20 +311,22 @@ jobs:
               ~PitchDetector() override;
               void prepare(double sampleRate);
               void feed(const float* samples, int numSamples);
+              void setVoicedThreshold(float rmsThreshold);
+              float getVoicedThreshold() const;
               Frame latestFrame() const;
               static juce::String freqToNote(float freq);
               static int   freqToMidi(float freq);
               static float midiToFreq(int midi);
           private:
               void run() override;
-              static constexpr int kRingSize = 8192;
-              static constexpr int kWindow   = 2048;
-              static constexpr int kHop      = 512;
-              static constexpr float kVoicedMicRmsThreshold = 0.015f;
+              static constexpr int64_t kRingSize = 8192;
+              static constexpr int64_t kWindow   = 2048;
+              static constexpr int64_t kHop      = 512;
 
-              std::array<float, kRingSize> ring{};
-              std::atomic<int> writePos { 0 };
-              std::atomic<int> lastAnalyzed { 0 };
+              std::array<float, (size_t)kRingSize> ring{};
+              std::atomic<int64_t> writePos { 0 };
+              std::atomic<int64_t> lastAnalyzed { 0 };
+              std::atomic<float>   voicedThreshold { 0.015f };
               double sr = 44100.0;
 
               std::atomic<float> outFreq { 0.0f };
@@ -297,9 +335,9 @@ jobs:
               std::atomic<int>   outMidi { -1 };
               std::atomic<bool>  outVoiced { false };
 
-              std::array<float, kWindow> buf{};
-              std::array<float, kWindow / 2> yin{};
-              std::array<float, kWindow / 2> cmnd{};
+              std::array<float, (size_t)kWindow> buf{};
+              std::array<float, (size_t)(kWindow / 2)> yin{};
+              std::array<float, (size_t)(kWindow / 2)> cmnd{};
               std::array<float, 8> pitchHist{};
               int  pitchHistCount = 0;
               std::array<int, 8> midiHist{};
@@ -316,20 +354,37 @@ jobs:
           PitchDetector::PitchDetector() : juce::Thread("PitchWorker") {}
           PitchDetector::~PitchDetector() { signalThreadShouldExit(); notify(); stopThread(2000); }
 
+          void PitchDetector::setVoicedThreshold(float rmsThreshold) {
+              voicedThreshold.store(juce::jlimit(0.0005f, 0.5f, rmsThreshold), std::memory_order_release);
+          }
+
+          float PitchDetector::getVoicedThreshold() const {
+              return voicedThreshold.load(std::memory_order_acquire);
+          }
+
           void PitchDetector::prepare(double sampleRate) {
               sr = sampleRate;
-              writePos.store(0); lastAnalyzed.store(0);
+              writePos.store(0, std::memory_order_release);
+              lastAnalyzed.store(0, std::memory_order_release);
               pitchHistCount = 0; midiHistCount = 0; lastMidiLocal = -1;
-              outFreq.store(0.0f); outConf.store(0.0f); outRms.store(0.0f);
-              outMidi.store(-1); outVoiced.store(false);
+              outFreq.store(0.0f, std::memory_order_release);
+              outConf.store(0.0f, std::memory_order_release);
+              outRms.store(0.0f, std::memory_order_release);
+              outMidi.store(-1, std::memory_order_release);
+              outVoiced.store(false, std::memory_order_release);
               if (!isThreadRunning()) startThread(juce::Thread::Priority::low);
           }
+
           void PitchDetector::feed(const float* s, int n) {
               if (!s || n <= 0) return;
-              int wp = writePos.load(std::memory_order_relaxed);
-              for (int i = 0; i < n; ++i) ring[(wp + i) % kRingSize] = s[i];
-              writePos.store(wp + n, std::memory_order_release);
+              const int64_t wp = writePos.load(std::memory_order_relaxed);
+              for (int i = 0; i < n; ++i) {
+                  const int64_t idx = (wp + (int64_t)i) % kRingSize;
+                  ring[(size_t)idx] = s[i];
+              }
+              writePos.store(wp + (int64_t)n, std::memory_order_release);
           }
+
           PitchDetector::Frame PitchDetector::latestFrame() const {
               Frame f;
               f.frequency  = outFreq.load(std::memory_order_acquire);
@@ -339,70 +394,92 @@ jobs:
               f.voiced     = outVoiced.load(std::memory_order_acquire);
               return f;
           }
+
           void PitchDetector::run() {
               while (!threadShouldExit()) {
                   wait(5);
-                  int wp = writePos.load(std::memory_order_acquire);
-                  if (wp - lastAnalyzed.load(std::memory_order_relaxed) < kHop) continue;
-                  if (wp < kWindow) { lastAnalyzed.store(wp, std::memory_order_relaxed); continue; }
-                  lastAnalyzed.store(wp, std::memory_order_relaxed);
-                  int start = wp - kWindow;
-                  for (int i = 0; i < kWindow; ++i) buf[i] = ring[(start + i) % kRingSize];
+                  const int64_t wp = writePos.load(std::memory_order_acquire);
+                  const int64_t prevAnalyzed = lastAnalyzed.load(std::memory_order_relaxed);
+                  if (wp - prevAnalyzed < kHop) continue;
+                  if (wp < kWindow) {
+                      lastAnalyzed.store(wp, std::memory_order_release);
+                      continue;
+                  }
+                  lastAnalyzed.store(wp, std::memory_order_release);
+
+                  const int64_t start = wp - kWindow;
+                  for (int64_t i = 0; i < kWindow; ++i) {
+                      const int64_t idx = (start + i) % kRingSize;
+                      buf[(size_t)i] = ring[(size_t)idx];
+                  }
 
                   double sqSum = 0.0;
-                  for (int i = 0; i < kWindow; ++i) sqSum += (double)buf[i] * (double)buf[i];
-                  float rms = (float)std::sqrt(sqSum / (double)kWindow);
+                  for (int64_t i = 0; i < kWindow; ++i) {
+                      const double sample = (double)buf[(size_t)i];
+                      sqSum += sample * sample;
+                  }
+                  const float rms = (float)std::sqrt(sqSum / (double)kWindow);
                   outRms.store(rms, std::memory_order_release);
+                  const float threshold = voicedThreshold.load(std::memory_order_acquire);
 
-                  const int half = kWindow / 2;
+                  const int half = (int)(kWindow / 2);
                   for (int tau = 1; tau < half; ++tau) {
                       double s = 0.0;
-                      for (int j = 0; j < half; ++j) { double d = buf[j] - buf[j + tau]; s += d * d; }
-                      yin[tau] = (float)s;
+                      for (int j = 0; j < half; ++j) {
+                          double d = (double)buf[(size_t)j] - (double)buf[(size_t)(j + tau)];
+                          s += d * d;
+                      }
+                      yin[(size_t)tau] = (float)s;
                   }
                   yin[0] = 0.0f; cmnd[0] = 1.0f;
                   double running = 0.0;
                   for (int tau = 1; tau < half; ++tau) {
-                      running += yin[tau];
-                      cmnd[tau] = running > 1e-9 ? (float)(yin[tau] * tau / running) : 1.0f;
+                      running += (double)yin[(size_t)tau];
+                      cmnd[(size_t)tau] = running > 1e-9 ? (float)((double)yin[(size_t)tau] * (double)tau / running) : 1.0f;
                   }
                   int tauEst = -1;
                   for (int tau = 2; tau < half - 1; ++tau) {
-                      if (cmnd[tau] < 0.15f) {
-                          while (tau + 1 < half && cmnd[tau + 1] < cmnd[tau]) ++tau;
+                      if (cmnd[(size_t)tau] < 0.15f) {
+                          while (tau + 1 < half && cmnd[(size_t)(tau + 1)] < cmnd[(size_t)tau]) ++tau;
                           tauEst = tau; break;
                       }
                   }
-                  if (tauEst < 0 || rms <= kVoicedMicRmsThreshold) { outVoiced.store(false, std::memory_order_release); continue; }
+                  if (tauEst < 0 || rms <= threshold) {
+                      outVoiced.store(false, std::memory_order_release);
+                      continue;
+                  }
                   float betterTau = (float)tauEst;
                   if (tauEst > 0 && tauEst < half - 1) {
-                      float s0 = cmnd[tauEst - 1], s1 = cmnd[tauEst], s2 = cmnd[tauEst + 1];
+                      float s0 = cmnd[(size_t)(tauEst - 1)], s1 = cmnd[(size_t)tauEst], s2 = cmnd[(size_t)(tauEst + 1)];
                       float denom = 2.0f * (2.0f * s1 - s2 - s0);
-                      if (std::abs(denom) > 1e-6f) betterTau = tauEst + (s2 - s0) / denom;
+                      if (std::abs(denom) > 1e-6f) betterTau = (float)tauEst + (s2 - s0) / denom;
                   }
-                  float freq = (float)(sr / betterTau);
-                  float conf = juce::jlimit(0.0f, 1.0f, 1.0f - cmnd[tauEst]);
-                  int midi = (int)std::round(69.0 + 12.0 * std::log2(freq / 440.0));
-                  if (midi < 21 || midi > 108) { outVoiced.store(false, std::memory_order_release); continue; }
+                  float freq = (float)(sr / (double)betterTau);
+                  float conf = juce::jlimit(0.0f, 1.0f, 1.0f - cmnd[(size_t)tauEst]);
+                  int midi = (int)std::round(69.0 + 12.0 * std::log2((double)freq / 440.0));
+                  if (midi < 21 || midi > 108) {
+                      outVoiced.store(false, std::memory_order_release);
+                      continue;
+                  }
                   if (lastMidiLocal > 0 && std::abs(midi - lastMidiLocal) == 12) {
                       int stable = 0;
-                      for (int k = 0; k < midiHistCount; ++k) if (midiHist[k] == midi) ++stable;
+                      for (int k = 0; k < midiHistCount; ++k) if (midiHist[(size_t)k] == midi) ++stable;
                       if (stable < 2) { midi = lastMidiLocal; freq = midiToFreq(midi); }
                   }
-                  if (pitchHistCount < 8) pitchHist[pitchHistCount++] = freq;
+                  if (pitchHistCount < 8) pitchHist[(size_t)(pitchHistCount++)] = freq;
                   else { std::rotate(pitchHist.begin(), pitchHist.begin()+1, pitchHist.end()); pitchHist[7] = freq; }
-                  if (midiHistCount < 8) midiHist[midiHistCount++] = midi;
+                  if (midiHistCount < 8) midiHist[(size_t)(midiHistCount++)] = midi;
                   else { std::rotate(midiHist.begin(), midiHist.begin()+1, midiHist.end()); midiHist[7] = midi; }
                   if (pitchHistCount >= 3) {
                       std::array<float, 8> s = pitchHist;
                       std::sort(s.begin(), s.begin() + pitchHistCount);
-                      float med = s[pitchHistCount / 2];
-                      if (std::abs(std::log2(med / freq)) > 0.4f) {
+                      float med = s[(size_t)(pitchHistCount / 2)];
+                      if (std::abs(std::log2((double)(med / freq))) > 0.4) {
                           freq = med;
-                          midi = (int)std::round(69.0 + 12.0 * std::log2(freq / 440.0));
+                          midi = (int)std::round(69.0 + 12.0 * std::log2((double)freq / 440.0));
                       }
                   }
-                  bool voiced = conf > 0.5f && freq > 60.0f && freq < 2000.0f && rms > kVoicedMicRmsThreshold;
+                  const bool voiced = conf > 0.5f && freq > 60.0f && freq < 2000.0f && rms > threshold;
                   if (voiced) lastMidiLocal = midi;
                   outFreq.store(freq, std::memory_order_release);
                   outConf.store(conf, std::memory_order_release);
@@ -410,6 +487,7 @@ jobs:
                   outVoiced.store(voiced, std::memory_order_release);
               }
           }
+
           juce::String PitchDetector::freqToNote(float freq) {
               if (freq <= 0.0f) return "-";
               static const char* N[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
@@ -418,9 +496,9 @@ jobs:
           }
           int PitchDetector::freqToMidi(float freq) {
               if (freq <= 0.0f) return 0;
-              return (int)std::round(69.0 + 12.0 * std::log2(freq / 440.0));
+              return (int)std::round(69.0 + 12.0 * std::log2((double)freq / 440.0));
           }
-          float PitchDetector::midiToFreq(int midi) { return 440.0f * std::pow(2.0f, (midi - 69) / 12.0f); }
+          float PitchDetector::midiToFreq(int midi) { return 440.0f * std::pow(2.0f, (float)(midi - 69) / 12.0f); }
           EOF
 
           # ── NoteTracker (60 ms hold + ±1 semitone flicker filter + audio-time onset) ──
@@ -588,12 +666,13 @@ jobs:
           }
           EOF
 
-          # ── KeyEstimator (major + minor Krumhansl) ──
+          # ── KeyEstimator (major + minor Krumhansl with reset) ──
           cat > Source/KeyEstimator.h << 'EOF'
           #pragma once
           class KeyEstimator {
           public:
               struct Result { int tonic; bool isMinor; float confidence; };
+              void reset();
               void addNoteDuration(int midi, double durationBeats);
               Result estimate() const;
           private:
@@ -607,6 +686,11 @@ jobs:
           #include <JuceHeader.h>
           #include <algorithm>
           #include <cmath>
+
+          void KeyEstimator::reset() {
+              for (auto& w : weights) w = 0.0f;
+              total = 0.0f;
+          }
 
           void KeyEstimator::addNoteDuration(int midi, double durationBeats) {
               for (auto& w : weights) w *= 0.995f;
@@ -648,13 +732,14 @@ jobs:
           }
           EOF
 
-          # ── TempoEstimator (from real onset times) ──
+          # ── TempoEstimator (from real onset times with reset) ──
           cat > Source/TempoEstimator.h << 'EOF'
           #pragma once
           #include <array>
           class TempoEstimator {
           public:
               struct Result { double bpm; float confidence; };
+              void reset();
               void addOnset(double timeSec);
               Result estimate() const;
           private:
@@ -669,6 +754,13 @@ jobs:
           #include "TempoEstimator.h"
           #include <JuceHeader.h>
           #include <algorithm>
+
+          void TempoEstimator::reset() {
+              iois.fill(0.0);
+              count = 0;
+              idx = 0;
+              lastOnset = -1.0;
+          }
 
           void TempoEstimator::addOnset(double t) {
               if (lastOnset > 0) {
@@ -1313,7 +1405,7 @@ jobs:
           }
           EOF
 
-          # ── Arranger ──
+          # ── Arranger (explicit field-existence checks and defaults for missing mixer/plan fields) ──
           cat > Source/Arranger.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
@@ -1359,6 +1451,14 @@ jobs:
           #include "Arranger.h"
           #include "Config.h"
 
+          namespace {
+              bool hasExistingValue(juce::DynamicObject* obj, const juce::Identifier& prop) {
+                  if (!obj || !obj->hasProperty(prop)) return false;
+                  const auto v = obj->getProperty(prop);
+                  return !v.isVoid() && !v.isUndefined();
+              }
+          }
+
           Arranger::Arranger() { ix::initNetSystem(); webSocket = std::make_unique<ix::WebSocket>(); }
           Arranger::~Arranger() { stop(); webSocket.reset(); ix::uninitNetSystem(); }
 
@@ -1392,48 +1492,59 @@ jobs:
               try {
                   auto v = juce::JSON::parse(juce::String(text));
                   auto* o = v.getDynamicObject(); if (!o) return;
+                  if (!hasExistingValue(o, "type")) return;
                   auto type = o->getProperty("type").toString();
                   if (type == "plan") {
                       auto plan = std::make_shared<PlanPayload>();
-                      plan->bar = (int)o->getProperty("bar");
-                      plan->tempo = (double)o->getProperty("tempo");
-                      plan->section = o->getProperty("section").toString();
-                      plan->chord = o->getProperty("chord").toString();
-                      if (auto* ev = o->getProperty("events").getArray()) {
-                          for (auto& e : *ev) {
-                              auto* eo = e.getDynamicObject(); if (!eo) continue;
-                              plan->events.push_back({
-                                  (double)eo->getProperty("bar"), (double)eo->getProperty("beat"),
-                                  (int)eo->getProperty("channel"), (int)eo->getProperty("note"),
-                                  (float)(double)eo->getProperty("velocity"), (double)eo->getProperty("duration")
-                              });
+                      plan->bar = hasExistingValue(o, "bar") ? (int)o->getProperty("bar") : 0;
+                      plan->tempo = hasExistingValue(o, "tempo") ? (double)o->getProperty("tempo") : 120.0;
+                      plan->section = hasExistingValue(o, "section") ? o->getProperty("section").toString() : juce::String();
+                      plan->chord = hasExistingValue(o, "chord") ? o->getProperty("chord").toString() : juce::String();
+
+                      if (hasExistingValue(o, "events")) {
+                          if (auto* ev = o->getProperty("events").getArray()) {
+                              for (auto& e : *ev) {
+                                  auto* eo = e.getDynamicObject(); if (!eo) continue;
+                                  double evBar = hasExistingValue(eo, "bar") ? (double)eo->getProperty("bar") : (double)plan->bar;
+                                  double evBeat = hasExistingValue(eo, "beat") ? (double)eo->getProperty("beat") : 0.0;
+                                  int evCh = hasExistingValue(eo, "channel") ? (int)eo->getProperty("channel") : 0;
+                                  int evNote = hasExistingValue(eo, "note") ? (int)eo->getProperty("note") : 60;
+                                  float evVel = hasExistingValue(eo, "velocity") ? (float)(double)eo->getProperty("velocity") : 0.8f;
+                                  double evDur = hasExistingValue(eo, "duration") ? (double)eo->getProperty("duration") : 0.5;
+                                  plan->events.push_back({ evBar, evBeat, evCh, evNote, evVel, evDur });
+                              }
                           }
                       }
-                      if (auto* mo = o->getProperty("mixer").getDynamicObject()) {
-                          for (auto& p : mo->getProperties()) {
-                              int ch = p.name.toString().getIntValue();
-                              if (ch < 0 || ch >= 16) continue;
-                              auto* co = p.value.getDynamicObject(); if (!co) continue;
-                              auto& m = plan->mixer[ch];
-                              m.present = true;
-                              m.preset = (int)co->getProperty("preset");
-                              m.volume = (float)(double)co->getProperty("volume");
-                              m.pan    = (float)(double)co->getProperty("pan");
-                              m.mute   = (bool)co->getProperty("mute");
-                              m.fade   = (float)(double)co->getProperty("fade");
+
+                      if (hasExistingValue(o, "mixer")) {
+                          if (auto* mo = o->getProperty("mixer").getDynamicObject()) {
+                              for (auto& p : mo->getProperties()) {
+                                  int ch = p.name.toString().getIntValue();
+                                  if (ch < 0 || ch >= 16) continue;
+                                  auto* co = p.value.getDynamicObject(); if (!co) continue;
+                                  auto& m = plan->mixer[ch];
+                                  m.present = true;
+                                  m.preset = hasExistingValue(co, "preset") ? (int)co->getProperty("preset") : -1;
+                                  m.volume = hasExistingValue(co, "volume") ? (float)(double)co->getProperty("volume") : 0.8f;
+                                  m.pan    = hasExistingValue(co, "pan")    ? (float)(double)co->getProperty("pan")    : 0.0f;
+                                  m.mute   = hasExistingValue(co, "mute")   ? (bool)co->getProperty("mute")         : false;
+                                  m.fade   = hasExistingValue(co, "fade")   ? (float)(double)co->getProperty("fade")   : 0.0f;
+                              }
                           }
                       }
                       const juce::ScopedLock sl(plansLock);
                       pendingPlans.push_back(std::move(plan));
                   } else if (type == "pong") {
-                      double t0 = (double)o->getProperty("ts");
-                      if (t0 > 0) rttMs.store((float)(juce::Time::getMillisecondCounterHiRes() - t0));
+                      if (hasExistingValue(o, "ts")) {
+                          double t0 = (double)o->getProperty("ts");
+                          if (t0 > 0) rttMs.store((float)(juce::Time::getMillisecondCounterHiRes() - t0));
+                      }
                   }
               } catch (...) {}
           }
           EOF
 
-          # ── MainComponent (juce::StringArray, input guard, Start reset, mixer slider clear) ──
+          # ── MainComponent (Speaker mode, Mic sensitivity + meter, Start resets estimators, StringArray) ──
           cat > Source/MainComponent.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
@@ -1458,6 +1569,9 @@ jobs:
               void audioDeviceAboutToStart(juce::AudioIODevice*) override;
               void audioDeviceStopped() override;
           private:
+              static constexpr float kDefaultMicThreshold = 0.015f;
+              static constexpr float kSpeakerModeThresholdFloor = 0.060f;
+
               void timerCallback() override;
               void startAudio();
               void stopAudio();
@@ -1465,6 +1579,7 @@ jobs:
               void sendState(bool phraseEnd);
               void resetMixerSliders();
               void rebuildMixerFromSnapshot(const InstrumentSnapshot& snap);
+              void syncEffectiveThresholdToDetector();
 
               juce::AudioDeviceManager deviceManager;
               std::unique_ptr<PitchDetector> pitchDetector;
@@ -1477,10 +1592,13 @@ jobs:
               std::unique_ptr<Arranger> arranger;
 
               juce::Label  noteLabel, chordLabel, stateLabel, keyLabel, tempoLabel,
-                           instrumentsLabel, headphoneLabel, rttLabel, bleedLabel;
+                           instrumentsLabel, speakerHintLabel, rttLabel, micSensitivityLabel;
               juce::TextButton startButton { "Start" }, settingsButton { "Audio" };
-              juce::ToggleButton headphonesToggle { "Headphones" };
+              juce::ToggleButton speakerModeToggle { "Speaker mode" };
               juce::Slider tempoSlider;
+              juce::Slider micSensitivitySlider;
+              juce::ProgressBar micLevelMeter;
+              double micLevelNormalized = 0.0;
               juce::OwnedArray<juce::Slider> channelSliders;
               juce::OwnedArray<juce::Label>  channelLabels;
               int channelIds[16];
@@ -1488,9 +1606,8 @@ jobs:
               std::atomic<float> currentFreq { 0.0f };
               std::atomic<float> currentConfidence { 0.0f };
               std::atomic<float> currentEnergy { 0.0f };
-              std::atomic<float> lastBandRms { 0.0f };
-              std::atomic<float> bleedCorrelation { 0.0f };
-              std::atomic<bool>  headphonesOn { false };
+              std::atomic<float> micThresholdSetting { kDefaultMicThreshold };
+              std::atomic<bool>  speakerModeOn { false };
               std::atomic<double> currentSampleRate { 44100.0 };
               std::atomic<float> userTempoBpm { 120.0f };
               std::atomic<float> userTempoConf { 0.0f };
@@ -1515,7 +1632,7 @@ jobs:
               l.setJustificationType(juce::Justification::centred);
           }
 
-          MainComponent::MainComponent() {
+          MainComponent::MainComponent() : micLevelMeter(micLevelNormalized) {
               for (int i = 0; i < 16; ++i) channelIds[i] = -1;
 
               styleLabel(stateLabel, 20.0f, juce::Colours::cyan);
@@ -1524,25 +1641,51 @@ jobs:
               styleLabel(keyLabel,   18.0f, juce::Colour::fromRGB(180,220,255));
               styleLabel(tempoLabel, 18.0f, juce::Colour::fromRGB(180,220,255));
               styleLabel(instrumentsLabel, 13.0f, juce::Colour::fromRGB(200,200,200));
-              styleLabel(headphoneLabel,   13.0f, juce::Colours::orange);
-              styleLabel(rttLabel,    13.0f, juce::Colours::grey);
-              styleLabel(bleedLabel,  13.0f, juce::Colours::orange);
-              headphoneLabel.setText("Headphones recommended", juce::dontSendNotification);
+              styleLabel(speakerHintLabel, 13.0f, juce::Colours::orange);
+              styleLabel(rttLabel, 13.0f, juce::Colours::grey);
+              styleLabel(micSensitivityLabel, 13.0f, juce::Colours::lightgrey);
+
+              speakerHintLabel.setText("Speaker mode off (raises threshold when on)", juce::dontSendNotification);
               rttLabel.setText("RTT: --", juce::dontSendNotification);
               keyLabel.setText("Key: - (0%)", juce::dontSendNotification);
               tempoLabel.setText("120 BPM", juce::dontSendNotification);
               instrumentsLabel.setText("Instruments: -", juce::dontSendNotification);
+              micSensitivityLabel.setText("Mic sensitivity", juce::dontSendNotification);
+
               for (auto* l : { &stateLabel, &noteLabel, &chordLabel, &keyLabel, &tempoLabel,
-                               &instrumentsLabel, &headphoneLabel, &rttLabel, &bleedLabel })
+                               &instrumentsLabel, &speakerHintLabel, &rttLabel, &micSensitivityLabel })
                   addAndMakeVisible(l);
 
               startButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(0,100,80));
               settingsButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(40,40,40));
               addAndMakeVisible(startButton);
               addAndMakeVisible(settingsButton);
-              headphonesToggle.setColour(juce::ToggleButton::textColourId, juce::Colours::white);
-              headphonesToggle.onClick = [this] { headphonesOn.store(headphonesToggle.getToggleState()); };
-              addAndMakeVisible(headphonesToggle);
+
+              speakerModeToggle.setToggleState(false, juce::dontSendNotification);
+              speakerModeToggle.setColour(juce::ToggleButton::textColourId, juce::Colours::white);
+              speakerModeToggle.onClick = [this] {
+                  speakerModeOn.store(speakerModeToggle.getToggleState(), std::memory_order_release);
+                  syncEffectiveThresholdToDetector();
+                  speakerHintLabel.setText(
+                      speakerModeToggle.getToggleState()
+                          ? "Speaker mode ON (higher voiced threshold active)"
+                          : "Speaker mode off (raises threshold when on)",
+                      juce::dontSendNotification);
+              };
+              addAndMakeVisible(speakerModeToggle);
+
+              micSensitivitySlider.setRange(0.002, 0.120, 0.001);
+              micSensitivitySlider.setValue((double)kDefaultMicThreshold, juce::dontSendNotification);
+              micSensitivitySlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 64, 22);
+              micSensitivitySlider.onValueChange = [this] {
+                  micThresholdSetting.store((float)micSensitivitySlider.getValue(), std::memory_order_release);
+                  syncEffectiveThresholdToDetector();
+              };
+              addAndMakeVisible(micSensitivitySlider);
+
+              micLevelMeter.setColour(juce::ProgressBar::foregroundColourId, juce::Colour::fromRGB(0, 220, 160));
+              micLevelMeter.setColour(juce::ProgressBar::backgroundColourId, juce::Colour::fromRGB(30, 35, 45));
+              addAndMakeVisible(micLevelMeter);
 
               tempoSlider.setRange(60.0, 200.0, 1.0);
               tempoSlider.setValue(120.0);
@@ -1566,10 +1709,19 @@ jobs:
                   }
               };
               settingsButton.onClick = [this] { showAudioSettings(); };
-              setSize(720, 800);
+              setSize(720, 840);
               startTimerHz(20);
           }
+
           MainComponent::~MainComponent() { stopTimer(); stopAudio(); }
+
+          void MainComponent::syncEffectiveThresholdToDetector() {
+              const float baseThr = micThresholdSetting.load(std::memory_order_acquire);
+              const float effThr = speakerModeOn.load(std::memory_order_acquire)
+                  ? juce::jmax(baseThr, kSpeakerModeThresholdFloor)
+                  : baseThr;
+              if (pitchDetector) pitchDetector->setVoicedThreshold(effThr);
+          }
 
           void MainComponent::showAudioSettings() {
               auto* sel = new juce::AudioDeviceSelectorComponent(deviceManager, 1, 2, 2, 2, false, false, true, false);
@@ -1596,7 +1748,15 @@ jobs:
               if (deviceManager.getCurrentAudioDevice()) return;
               resetMixerSliders();
               chordInference.clear();
+              keyEstimator.reset();
+              tempoEstimator.reset();
+              userKeyPc.store(0);
+              userKeyMinor.store(0);
+              userKeyConf.store(0.0f);
+              userTempoBpm.store(120.0f);
+              userTempoConf.store(0.0f);
               pendingNotesForSend.clear();
+
               auto err = deviceManager.initialiseWithDefaultDevices(1, 2);
               if (err.isNotEmpty()) { stateLabel.setText("AUDIO ERROR: " + err, juce::dontSendNotification); return; }
               deviceManager.addAudioCallback(this);
@@ -1606,6 +1766,7 @@ jobs:
               startButton.setButtonText("Stop");
               stateLabel.setText("CONNECTING...", juce::dontSendNotification);
           }
+
           void MainComponent::stopAudio() {
               if (arranger) { arranger->stop(); arranger.reset(); }
               if (deviceManager.getCurrentAudioDevice()) {
@@ -1615,17 +1776,20 @@ jobs:
               scheduler.stop();
               synth.allNotesOff();
           }
+
           void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* d) {
               const double sr = d->getCurrentSampleRate();
               currentSampleRate.store(sr);
               pitchDetector = std::make_unique<PitchDetector>();
               pitchDetector->prepare(sr);
+              syncEffectiveThresholdToDetector();
               noteTracker.setBeatsPerBar(4);
               noteTracker.resetAudioClock();
               scheduler.setSampleRate(sr);
               synth.initialize(sr);
               synth.prepareLimiterForBlock(juce::jmax(4096, d->getCurrentBufferSizeSamples()));
           }
+
           void MainComponent::audioDeviceStopped() { pitchDetector.reset(); }
 
           void MainComponent::audioDeviceIOCallbackWithContext(
@@ -1645,24 +1809,6 @@ jobs:
               auto frame = pitchDetector ? pitchDetector->latestFrame() : PitchDetector::Frame{};
               frame.rms = micRms;
 
-              static thread_local float prevBand[4096];
-              static thread_local int prevBandN = 0;
-              int m = juce::jmin(n, prevBandN);
-              if (hasMic && m > 0 && !headphonesOn.load()) {
-                  double sm = 0, sb = 0, smb = 0, sm2 = 0, sb2 = 0;
-                  for (int i = 0; i < m; ++i) {
-                      double a = in[0][i], b = prevBand[i];
-                      sm += a; sb += b; smb += a * b; sm2 += a * a; sb2 += b * b;
-                  }
-                  double num = m * smb - sm * sb;
-                  double den = std::sqrt((m * sm2 - sm * sm) * (m * sb2 - sb * sb));
-                  double r = den > 1e-9 ? num / den : 0.0;
-                  bleedCorrelation.store((float)r);
-                  if (r > 0.6) frame.voiced = false;
-              } else {
-                  bleedCorrelation.store(0.0f);
-              }
-
               currentFreq.store(frame.voiced ? frame.frequency : 0.0f);
               currentConfidence.store(frame.confidence);
               noteTracker.processBlockFrames(frame, scheduler.getBeatPosition(), scheduler.getCurrentBar(),
@@ -1671,12 +1817,6 @@ jobs:
               scheduler.processBlock(n, synth);
               if (nOut >= 1 && out != nullptr && out[0] != nullptr) {
                   synth.render(out[0], (nOut >= 2 ? out[1] : nullptr), n);
-                  int copy = juce::jmin(n, 4096);
-                  for (int i = 0; i < copy; ++i) prevBand[i] = out[0][i];
-                  prevBandN = copy;
-                  double sse = 0.0;
-                  for (int i = 0; i < n; ++i) sse += (double)out[0][i] * (double)out[0][i];
-                  lastBandRms.store((float)std::sqrt(sse / (double)n));
               }
               for (int ch = 2; ch < nOut; ++ch)
                   if (out != nullptr && out[ch] != nullptr) juce::FloatVectorOperations::clear(out[ch], n);
@@ -1788,6 +1928,8 @@ jobs:
               }
 
               float f = currentFreq.load(), conf = currentConfidence.load(), e = currentEnergy.load();
+              micLevelNormalized = juce::jlimit(0.0, 1.0, (double)(e * 6.0f));
+
               if (f > 0.0f && conf > 0.4f) {
                   noteLabel.setText(PitchDetector::freqToNote(f), juce::dontSendNotification);
                   chordLabel.setText(chordInference.getChord(), juce::dontSendNotification);
@@ -1808,6 +1950,7 @@ jobs:
                   stateLabel.setText("STOPPED", juce::dontSendNotification);
                   stateLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
               }
+
               juce::String keyStr = juce::String(GM_KEYS[userKeyPc.load()])
                                   + (userKeyMinor.load() ? " minor" : " major");
               keyLabel.setText("Key: " + keyStr + " (" + juce::String((int)(userKeyConf.load() * 100)) + "%)",
@@ -1827,11 +1970,6 @@ jobs:
               instrumentsLabel.setText(parts.isEmpty() ? "Instruments: -" : parts.joinIntoString(" | "),
                                        juce::dontSendNotification);
               rebuildMixerFromSnapshot(snap);
-
-              float bc = bleedCorrelation.load();
-              bleedLabel.setText(bc > 0.6f ? "Mic bleed detected (use headphones or toggle above)"
-                                           : "", juce::dontSendNotification);
-              headphoneLabel.setVisible(bc <= 0.6f);
 
               if (arranger) {
                   if (arranger->isConnected())
@@ -1879,16 +2017,24 @@ jobs:
               chordLabel.setBounds(area.removeFromTop(42));
               keyLabel.setBounds(area.removeFromTop(24));
               instrumentsLabel.setBounds(area.removeFromTop(20));
-              bleedLabel.setBounds(area.removeFromTop(20));
-              headphoneLabel.setBounds(area.removeFromTop(20));
-              auto tempoRow = area.removeFromTop(32);
+              speakerHintLabel.setBounds(area.removeFromTop(20));
+
+              auto tempoRow = area.removeFromTop(30);
               tempoLabel.setBounds(tempoRow.removeFromLeft(tempoRow.getWidth() * 2 / 3));
               tempoSlider.setBounds(tempoRow.removeFromLeft(200).reduced(2));
-              auto hpRow = area.removeFromTop(26);
-              headphonesToggle.setBounds(hpRow.removeFromLeft(160));
+
+              auto micRow = area.removeFromTop(30);
+              micSensitivityLabel.setBounds(micRow.removeFromLeft(120));
+              micLevelMeter.setBounds(micRow.removeFromLeft(110).reduced(4));
+              micSensitivitySlider.setBounds(micRow.reduced(2));
+
+              auto modeRow = area.removeFromTop(28);
+              speakerModeToggle.setBounds(modeRow.removeFromLeft(180));
+
               auto buttons = area.removeFromBottom(46);
               startButton.setBounds(buttons.removeFromLeft(buttons.getWidth() / 2).reduced(6));
               settingsButton.setBounds(buttons.reduced(6));
+
               auto mixer = area.removeFromBottom(160);
               int n = channelSliders.size();
               if (n > 0) {
@@ -1967,15 +2113,6 @@ jobs:
       - name: Clone JUCE
         if: steps.cache-juce.outputs.cache-hit != 'true'
         run: git clone --branch ${{ env.JUCE_VERSION }} --depth 1 https://github.com/juce-framework/JUCE.git
-      - name: Write config
-        env:
-          SERVER_URL:   ${{ secrets.AI_LIVE_BAND_SERVER_URL }}
-          SERVER_TOKEN: ${{ secrets.AI_LIVE_BAND_ACCESS_TOKEN }}
-        run: |
-          [ -n "$SERVER_URL" ] || { echo "::error::AI_LIVE_BAND_SERVER_URL secret missing"; exit 1; }
-          [ -n "$SERVER_TOKEN" ] || { echo "::error::AI_LIVE_BAND_ACCESS_TOKEN secret missing"; exit 1; }
-          printf '#pragma once\n#define AI_LIVE_BAND_SERVER_URL "%s"\n#define AI_LIVE_BAND_ACCESS_TOKEN "%s"\n' \
-            "$SERVER_URL" "$SERVER_TOKEN" > Source/Config.h
       - name: Install Linux deps
         run: |
           sudo apt-get update
@@ -2013,16 +2150,6 @@ jobs:
       - name: Clone JUCE
         if: steps.cache-juce.outputs.cache-hit != 'true'
         run: git clone --branch ${{ env.JUCE_VERSION }} --depth 1 https://github.com/juce-framework/JUCE.git
-      - name: Write config
-        shell: bash
-        env:
-          SERVER_URL:   ${{ secrets.AI_LIVE_BAND_SERVER_URL }}
-          SERVER_TOKEN: ${{ secrets.AI_LIVE_BAND_ACCESS_TOKEN }}
-        run: |
-          [ -n "$SERVER_URL" ] || { echo "::error::AI_LIVE_BAND_SERVER_URL secret missing"; exit 1; }
-          [ -n "$SERVER_TOKEN" ] || { echo "::error::AI_LIVE_BAND_ACCESS_TOKEN secret missing"; exit 1; }
-          printf '#pragma once\n#define AI_LIVE_BAND_SERVER_URL "%s"\n#define AI_LIVE_BAND_ACCESS_TOKEN "%s"\n' \
-            "$SERVER_URL" "$SERVER_TOKEN" > Source/Config.h
       - uses: ilammy/msvc-dev-cmd@v1
       - name: Configure & Build
         run: |
@@ -2051,15 +2178,6 @@ jobs:
       - name: Clone JUCE
         if: steps.cache-juce.outputs.cache-hit != 'true'
         run: git clone --branch ${{ env.JUCE_VERSION }} --depth 1 https://github.com/juce-framework/JUCE.git
-      - name: Write config
-        env:
-          SERVER_URL:   ${{ secrets.AI_LIVE_BAND_SERVER_URL }}
-          SERVER_TOKEN: ${{ secrets.AI_LIVE_BAND_ACCESS_TOKEN }}
-        run: |
-          [ -n "$SERVER_URL" ] || { echo "::error::AI_LIVE_BAND_SERVER_URL secret missing"; exit 1; }
-          [ -n "$SERVER_TOKEN" ] || { echo "::error::AI_LIVE_BAND_ACCESS_TOKEN secret missing"; exit 1; }
-          printf '#pragma once\n#define AI_LIVE_BAND_SERVER_URL "%s"\n#define AI_LIVE_BAND_ACCESS_TOKEN "%s"\n' \
-            "$SERVER_URL" "$SERVER_TOKEN" > Source/Config.h
       - name: Install Ninja
         run: brew install ninja || true
       - name: Configure & Build
@@ -2093,15 +2211,6 @@ jobs:
       - name: Clone JUCE
         if: steps.cache-juce.outputs.cache-hit != 'true'
         run: git clone --branch ${{ env.JUCE_VERSION }} --depth 1 https://github.com/juce-framework/JUCE.git
-      - name: Write config
-        env:
-          SERVER_URL:   ${{ secrets.AI_LIVE_BAND_SERVER_URL }}
-          SERVER_TOKEN: ${{ secrets.AI_LIVE_BAND_ACCESS_TOKEN }}
-        run: |
-          [ -n "$SERVER_URL" ] || { echo "::error::AI_LIVE_BAND_SERVER_URL secret missing"; exit 1; }
-          [ -n "$SERVER_TOKEN" ] || { echo "::error::AI_LIVE_BAND_ACCESS_TOKEN secret missing"; exit 1; }
-          printf '#pragma once\n#define AI_LIVE_BAND_SERVER_URL "%s"\n#define AI_LIVE_BAND_ACCESS_TOKEN "%s"\n' \
-            "$SERVER_URL" "$SERVER_TOKEN" > Source/Config.h
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
       - name: Install Android SDK components
