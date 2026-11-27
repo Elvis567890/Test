@@ -24,7 +24,7 @@ jobs:
           set -euo pipefail
 
           TSF_URLS="https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h https://raw.githubusercontent.com/schellingb/TinySoundFont/HEAD/tsf.h https://raw.githubusercontent.com/schellingb/TinySoundFont/main/tsf.h"
-          SF_URL="https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2"
+          SF_URLS="https://raw.githubusercontent.com/schellingb/TinySoundFont/master/soundfont.sf2 https://raw.githubusercontent.com/schellingb/TinySoundFont/HEAD/soundfont.sf2 https://raw.githubusercontent.com/musescore/MuseScore/master/share/sound/MuseScore_General/MuseScore_General.sf2 https://raw.githubusercontent.com/FluidSynth/fluidsynth/master/sf2/VintageDreamsWaves-v2.sf2 https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2"
 
           got_tsf=0
           for url in $TSF_URLS; do
@@ -114,17 +114,28 @@ jobs:
               sys.exit(1)
           PY
 
-          if ! curl -fsSL --retry 3 --retry-delay 3 -o SoundFont.sf2 "$SF_URL"; then
-            echo "::error::Failed to download SoundFont from $SF_URL"
+          got_sf2=0
+          for url in $SF_URLS; do
+            rm -f SoundFont.sf2
+            echo "Trying SoundFont URL: $url"
+            if curl -fsSL --retry 2 --retry-delay 2 -o SoundFont.sf2 "$url"; then
+              if python3 verify_sf2.py SoundFont.sf2; then
+                echo "OK: Downloaded and verified SoundFont.sf2 from $url"
+                got_sf2=1
+                break
+              else
+                echo "SoundFont from $url failed validation; trying next URL..."
+              fi
+            else
+              echo "Failed to download SoundFont from $url; trying next URL..."
+            fi
+          done
+
+          if [ "$got_sf2" != "1" ]; then
+            rm -f SoundFont.sf2
+            echo "::error::Could not download a valid SoundFont under 20 MB with all 128 GM presets and drums from any URL."
             exit 1
           fi
-
-          if ! python3 verify_sf2.py SoundFont.sf2; then
-            echo "::error::SoundFont failed validation (must be under 20 MB with all 128 GM presets and drums)."
-            exit 1
-          fi
-
-          echo "OK: Downloaded and verified SoundFont.sf2 under 20 MB."
 
       - name: Create project files
         run: |
