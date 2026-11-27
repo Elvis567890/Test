@@ -1,443 +1,1125 @@
 
-name: AFRINODE AI LIVE BAND - Generate Server Files
+name: Build AfriNode AI Live Band
 
 on:
-  workflow_dispatch:
   push:
-    paths:
-      - ".github/workflows/generate-afrinode-live-band.yml"
+    branches: [main, master, first-prototype]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: afrinode-live-band-generator
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JUCE_VERSION: 8.0.6
+  ANDROID_NDK_VERSION: 26.3.11579264
+  SERVER_URL: ws://13.140.90.83:8765
 
 jobs:
-  generate:
+  scaffold:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 20
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Create server files
+      - name: Download SoundFont
         shell: bash
         run: |
-          mkdir -p server tests docs
+          set -e
+          mkdir -p Source
 
-          cat > server/requirements.txt <<'EOF'
-          websockets>=13,<16
+          curl -fL --retry 3 \
+            https://raw.githubusercontent.com/schellingb/TinySoundFont/HEAD/tsf.h \
+            -o Source/tsf.h
+
+          curl -fL --retry 3 \
+            https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2 \
+            -o Source/SoundFont.sf2
+
+          grep -q TSF_IMPLEMENTATION Source/tsf.h
+          test "$(head -c 4 Source/SoundFont.sf2)" = "RIFF"
+
+      - name: Generate application sources
+        shell: bash
+        run: |
+          set -e
+
+          cat > Source/Config.h <<'EOF'
+          #pragma once
+          #define AI_LIVE_BAND_SERVER_URL "ws://13.140.90.83:8765"
+          #define AI_LIVE_BAND_PROTOCOL "afrinode-live-band-v1"
           EOF
 
-          cat > server/app.py <<'PY'
-          import asyncio
-          import json
-          import math
-          import os
-          import time
-          import uuid
-          from websockets.asyncio.server import serve
+          cat > Source/PitchDetector.h <<'EOF'
+          #pragma once
+          #include <JuceHeader.h>
 
-          HOST = "0.0.0.0"
-          PORT = int(os.getenv("PORT", "8765"))
-          UPDATE_INTERVAL = 1.5
-
-          SCALES = {
-              "C": [60, 62, 64, 65, 67, 69, 71],
-              "D": [62, 64, 66, 67, 69, 71, 73],
-              "E": [64, 66, 68, 69, 71, 73, 75],
-              "F": [65, 67, 69, 70, 72, 74, 76],
-              "G": [67, 69, 71, 72, 74, 76, 78],
-              "A": [69, 71, 73, 74, 76, 78, 80],
-          }
-
-          CHORDS = {
-              "C": [0, 2, 4],
-              "Dm": [1, 3, 5],
-              "Em": [2, 4, 6],
-              "F": [3, 5, 0],
-              "G": [4, 6, 1],
-              "Am": [5, 0, 2],
-          }
-
-          SESSIONS = {}
-
-          def clamp(value, low, high):
-              return max(low, min(high, value))
-
-          def safe_number(value, default, low, high):
-              try:
-                  return clamp(float(value), low, high)
-              except (TypeError, ValueError):
-                  return default
-
-          def infer_style(message):
-              style = str(message.get("style", "Gospel")).strip()
-              allowed = {
-                  "Gospel", "Worship", "Afrobeat",
-                  "Jazz", "Pop", "Reggae", "Soul"
-              }
-              return style if style in allowed else "Gospel"
-
-          def infer_key(message):
-              key = str(message.get("key", "C")).strip()
-              return key if key in SCALES else "C"
-
-          def infer_chord(message):
-              chord = str(message.get("chord", "C")).strip()
-              return chord if chord in CHORDS else "C"
-
-          def make_events(key, chord, style, bpm):
-              scale = SCALES[key]
-              chord_degrees = CHORDS[chord]
-              beat_ms = 60000.0 / bpm
-
-              # Each event is a MIDI note instruction.
-              # The Android app must schedule these locally.
-              events = []
-
-              # Bass: root note on each beat.
-              root = scale[chord_degrees[0]] - 24
-              for beat in range(4):
-                  events.append({
-                      "time_ms": round(beat * beat_ms),
-                      "duration_ms": round(beat_ms * 0.75),
-                      "note": root,
-                      "velocity": 92,
-                      "instrument": "bass"
-                  })
-
-              # Chord accompaniment.
-              chord_notes = [
-                  scale[degree] + 12 for degree in chord_degrees
-              ]
-
-              for beat in range(4):
-                  if style in ("Worship", "Jazz", "Soul"):
-                      beat_position = beat * beat_ms
-                  elif style == "Reggae":
-                      beat_position = (beat + 0.5) * beat_ms
-                  else:
-                      beat_position = beat * beat_ms
-
-                  for note in chord_notes:
-                      events.append({
-                          "time_ms": round(beat_position),
-                          "duration_ms": round(beat_ms * 0.8),
-                          "note": note,
-                          "velocity": 65,
-                          "instrument": "keys"
-                      })
-
-              # Simple melodic response.
-              melody_degrees = chord_degrees + [chord_degrees[1]]
-              for index, degree in enumerate(melody_degrees):
-                  events.append({
-                      "time_ms": round(index * beat_ms),
-                      "duration_ms": round(beat_ms * 0.45),
-                      "note": scale[degree] + 24,
-                      "velocity": 72,
-                      "instrument": "lead"
-                  })
-
-              events.sort(key=lambda item: item["time_ms"])
-              return events
-
-          def make_arrangement(message):
-              key = infer_key(message)
-              chord = infer_chord(message)
-              style = infer_style(message)
-              bpm = safe_number(message.get("bpm"), 90, 50, 180)
-
-              return {
-                  "type": "arrangement",
-                  "protocol": "afrinode-live-band-v1",
-                  "session_id": message.get("session_id"),
-                  "timestamp_ms": int(time.time() * 1000),
-                  "key": key,
-                  "chord": chord,
-                  "style": style,
-                  "bpm": round(bpm, 1),
-                  "beats_per_bar": 4,
-                  "bar_duration_ms": round(240000 / bpm),
-                  "events": make_events(key, chord, style, bpm)
-              }
-
-          async def send_json(websocket, payload):
-              await websocket.send(json.dumps(payload))
-
-          async def handle_client(websocket):
-              session_id = str(uuid.uuid4())
-              SESSIONS[session_id] = {
-                  "last_sent": 0.0,
-                  "active": False
-              }
-
-              print("Connected:", session_id)
-
-              try:
-                  await send_json(websocket, {
-                      "type": "connected",
-                      "protocol": "afrinode-live-band-v1",
-                      "session_id": session_id
-                  })
-
-                  async for raw_message in websocket:
-                      try:
-                          message = json.loads(raw_message)
-                      except json.JSONDecodeError:
-                          await send_json(websocket, {
-                              "type": "error",
-                              "message": "Message must be valid JSON"
-                          })
-                          continue
-
-                      if not isinstance(message, dict):
-                          await send_json(websocket, {
-                              "type": "error",
-                              "message": "Expected a JSON object"
-                          })
-                          continue
-
-                      message_type = message.get("type")
-
-                      if message_type == "ping":
-                          await send_json(websocket, {
-                              "type": "pong",
-                              "timestamp_ms": int(time.time() * 1000)
-                          })
-                          continue
-
-                      if message_type == "stop":
-                          SESSIONS[session_id]["active"] = False
-                          await send_json(websocket, {
-                              "type": "stopped",
-                              "session_id": session_id
-                          })
-                          continue
-
-                      if message_type == "start":
-                          SESSIONS[session_id]["active"] = True
-                          message["session_id"] = session_id
-                          await send_json(websocket, {
-                              "type": "started",
-                              "session_id": session_id
-                          })
-                          arrangement = make_arrangement(message)
-                          await send_json(websocket, arrangement)
-                          SESSIONS[session_id]["last_sent"] = time.monotonic()
-                          continue
-
-                      if message_type in ("vocal_features", "update"):
-                          if not SESSIONS[session_id]["active"]:
-                              continue
-
-                          now = time.monotonic()
-                          last_sent = SESSIONS[session_id]["last_sent"]
-
-                          # Limit arrangement updates to avoid flooding
-                          # the Android app with repeated instructions.
-                          if now - last_sent < UPDATE_INTERVAL:
-                              continue
-
-                          message["session_id"] = session_id
-                          arrangement = make_arrangement(message)
-                          await send_json(websocket, arrangement)
-                          SESSIONS[session_id]["last_sent"] = now
-                          continue
-
-                      await send_json(websocket, {
-                          "type": "error",
-                          "message": "Unknown message type"
-                      })
-
-              except Exception as exc:
-                  print("Client error:", repr(exc))
-              finally:
-                  SESSIONS.pop(session_id, None)
-                  print("Disconnected:", session_id)
-
-          async def main():
-              print(f"AfriNode Live Band server listening on {HOST}:{PORT}")
-              async with serve(
-                  handle_client,
-                  HOST,
-                  PORT,
-                  ping_interval=20,
-                  ping_timeout=20,
-                  max_size=1024 * 1024
-              ):
-                  await asyncio.Future()
-
-          if __name__ == "__main__":
-              asyncio.run(main())
-          PY
-
-          cat > server/Dockerfile <<'EOF'
-          FROM python:3.11-slim
-          WORKDIR /app
-          COPY requirements.txt .
-          RUN pip install --no-cache-dir -r requirements.txt
-          COPY app.py .
-          ENV PORT=8765
-          EXPOSE 8765
-          CMD ["python", "app.py"]
+          class PitchDetector {
+          public:
+              explicit PitchDetector(double sampleRate);
+              float detect(const float* samples, int count, float& confidence);
+              static int freqToMidi(float frequency);
+              static juce::String freqToNote(float frequency);
+          private:
+              double sampleRate;
+          };
           EOF
 
-          cat > server/README.md <<'EOF'
-          # AfriNode Live Band Server
+          cat > Source/PitchDetector.cpp <<'EOF'
+          #include "PitchDetector.h"
 
-          WebSocket arrangement server for the AfriNode AI Live Band project.
+          PitchDetector::PitchDetector(double rate) : sampleRate(rate) {}
 
-          ## Start
+          float PitchDetector::detect(const float* samples, int count, float& confidence) {
+              confidence = 0.0f;
+              if (!samples || count < 256 || sampleRate <= 0) return 0.0f;
 
-          ```bash
-          pip install -r requirements.txt
-          python app.py
-          ```
+              double mean = 0.0;
+              for (int i = 0; i < count; ++i) mean += samples[i];
+              mean /= count;
 
-          Default port: 8765
+              double energy = 0.0;
+              for (int i = 0; i < count; ++i) {
+                  double x = samples[i] - mean;
+                  energy += x * x;
+              }
 
-          WebSocket address:
+              if (energy < 0.00001) return 0.0f;
 
-          `ws://YOUR_SERVER_IP:8765`
+              int minLag = juce::jmax(1, (int)(sampleRate / 1000.0));
+              int maxLag = juce::jmin(count / 2, (int)(sampleRate / 65.0));
 
-          ## Start a performance
+              int bestLag = 0;
+              double best = 0.0;
 
-          Send:
+              for (int lag = minLag; lag <= maxLag; ++lag) {
+                  double corr = 0.0;
+                  double normA = 0.0;
+                  double normB = 0.0;
 
-          ```json
-          {
-            "type": "start",
-            "style": "Gospel",
-            "key": "C",
-            "chord": "C",
-            "bpm": 90
+                  for (int i = 0; i < count - lag; ++i) {
+                      double a = samples[i] - mean;
+                      double b = samples[i + lag] - mean;
+                      corr += a * b;
+                      normA += a * a;
+                      normB += b * b;
+                  }
+
+                  double normalized = corr / std::sqrt(normA * normB + 1.0e-12);
+                  if (normalized > best) {
+                      best = normalized;
+                      bestLag = lag;
+                  }
+              }
+
+              confidence = (float)best;
+              if (bestLag == 0 || best < 0.45) return 0.0f;
+              return (float)(sampleRate / bestLag);
           }
-          ```
 
-          ## Send updated vocal features
-
-          ```json
-          {
-            "type": "vocal_features",
-            "style": "Worship",
-            "key": "C",
-            "chord": "Am",
-            "bpm": 82,
-            "pitch_hz": 220,
-            "confidence": 0.9
+          int PitchDetector::freqToMidi(float frequency) {
+              if (frequency <= 0) return 0;
+              return (int)std::round(69.0 + 12.0 * std::log2(frequency / 440.0));
           }
-          ```
 
-          Updates are rate-limited to one arrangement every 1.5 seconds.
-
-          ## Stop
-
-          ```json
-          {"type": "stop"}
-          ```
-
-          ## Important
-
-          This server sends musical arrangement instructions as JSON.
-          It does not stream audio. The Android app must parse each
-          arrangement's `events` array and schedule MIDI notes through
-          its local SoundFont synthesizer.
-
-          Each event contains:
-          - `time_ms`: time relative to the beginning of the bar
-          - `duration_ms`: note duration
-          - `note`: MIDI note number
-          - `velocity`: MIDI velocity
-          - `instrument`: bass, keys, or lead
+          juce::String PitchDetector::freqToNote(float frequency) {
+              if (frequency <= 0) return "-";
+              static const char* names[] = {
+                  "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
+              };
+              int midi = freqToMidi(frequency);
+              return juce::String(names[midi % 12]) + juce::String(midi / 12 - 1);
+          }
           EOF
 
-          cat > tests/test_server.py <<'PY'
-          import os
+          cat > Source/ChordInference.h <<'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          #include <array>
+          #include <atomic>
+
+          class ChordInference {
+          public:
+              void addNote(int midi);
+              juce::String getChord() const;
+              void clear();
+          private:
+              std::array<std::atomic<int>, 12> counts {};
+              std::atomic<int> cursor {0};
+              std::array<int, 12> history {};
+          };
+          EOF
+
+          cat > Source/ChordInference.cpp <<'EOF'
+          #include "ChordInference.h"
+
+          void ChordInference::addNote(int midi) {
+              if (midi <= 0) return;
+              int pc = midi % 12;
+              int position = cursor.fetch_add(1) % 12;
+              if (history[position] >= 0) counts[history[position]].fetch_sub(1);
+              history[position] = pc;
+              counts[pc].fetch_add(1);
+          }
+
+          void ChordInference::clear() {
+              for (auto& c : counts) c.store(0);
+              history.fill(-1);
+              cursor.store(0);
+          }
+
+          juce::String ChordInference::getChord() const {
+              static const char* roots[] = {
+                  "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
+              };
+              static const int major[] = {0,4,7};
+              static const int minor[] = {0,3,7};
+
+              int bestRoot = 0;
+              int bestScore = -9999;
+              bool bestMinor = false;
+
+              for (int root = 0; root < 12; ++root) {
+                  for (int q = 0; q < 2; ++q) {
+                      const int* intervals = q ? minor : major;
+                      int score = 0;
+                      for (int pc = 0; pc < 12; ++pc) {
+                          bool included = false;
+                          for (int i = 0; i < 3; ++i)
+                              if ((root + intervals[i]) % 12 == pc) included = true;
+                          score += counts[pc].load() * (included ? 2 : -1);
+                      }
+                      if (score > bestScore) {
+                          bestScore = score;
+                          bestRoot = root;
+                          bestMinor = q != 0;
+                      }
+                  }
+              }
+
+              return juce::String(roots[bestRoot]) +
+                     (bestMinor ? "m" : "");
+          }
+          EOF
+
+          cat > Source/SoundFontSynth.h <<'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          #include <vector>
+          #include <mutex>
+          struct tsf;
+
+          class SoundFontSynth {
+          public:
+              SoundFontSynth();
+              ~SoundFontSynth();
+
+              void initialize(double sampleRate);
+              void noteOn(int channel, int note, float velocity);
+              void noteOff(int channel, int note);
+              void render(float* left, float* right, int samples);
+              void setInstrument(int channel, int program);
+
+          private:
+              tsf* synth = nullptr;
+              double rate = 44100.0;
+              std::mutex synthMutex;
+              std::vector<float> scratch;
+          };
+          EOF
+
+          cat > Source/SoundFontSynth.cpp <<'EOF'
+          #include "SoundFontSynth.h"
+          #define TSF_IMPLEMENTATION
+          #include "tsf.h"
+
+          SoundFontSynth::SoundFontSynth() {}
+
+          SoundFontSynth::~SoundFontSynth() {
+              std::lock_guard<std::mutex> guard(synthMutex);
+              if (synth) tsf_close(synth);
+              synth = nullptr;
+          }
+
+          void SoundFontSynth::initialize(double sampleRate) {
+              std::lock_guard<std::mutex> guard(synthMutex);
+              if (synth) tsf_close(synth);
+              synth = tsf_load_filename("SoundFont.sf2");
+              rate = sampleRate > 0 ? sampleRate : 44100.0;
+              if (synth) {
+                  tsf_set_output(synth, TSF_STEREO_INTERLEAVED, (int)rate, 0);
+                  tsf_channel_set_presetnumber(synth, 0, 0, 0);
+                  tsf_channel_set_presetnumber(synth, 1, 32, 0);
+                  tsf_channel_set_presetnumber(synth, 2, 48, 0);
+                  tsf_channel_set_presetnumber(synth, 3, 56, 0);
+              }
+          }
+
+          void SoundFontSynth::noteOn(int channel, int note, float velocity) {
+              std::lock_guard<std::mutex> guard(synthMutex);
+              if (synth) tsf_channel_note_on(synth, channel, note,
+                                              juce::jlimit(0.0f, 1.0f, velocity));
+          }
+
+          void SoundFontSynth::noteOff(int channel, int note) {
+              std::lock_guard<std::mutex> guard(synthMutex);
+              if (synth) tsf_channel_note_off(synth, channel, note);
+          }
+
+          void SoundFontSynth::setInstrument(int channel, int program) {
+              std::lock_guard<std::mutex> guard(synthMutex);
+              if (synth) tsf_channel_set_presetnumber(synth, channel, program, 0);
+          }
+
+          void SoundFontSynth::render(float* left, float* right, int samples) {
+              if (!left || samples <= 0) return;
+              std::lock_guard<std::mutex> guard(synthMutex);
+
+              if (!synth) {
+                  juce::FloatVectorOperations::clear(left, samples);
+                  if (right) juce::FloatVectorOperations::clear(right, samples);
+                  return;
+              }
+
+              scratch.resize((size_t)samples * 2);
+              tsf_render_float(synth, scratch.data(), samples, 0);
+
+              for (int i = 0; i < samples; ++i) {
+                  left[i] = scratch[(size_t)i * 2];
+                  if (right) right[i] = scratch[(size_t)i * 2 + 1];
+              }
+          }
+          EOF
+
+          cat > Source/Arranger.h <<'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          #include "SoundFontSynth.h"
+          #include <ixwebsocket/IXWebSocket.h>
+          #include <atomic>
+          #include <mutex>
+          #include <vector>
+
+          class Arranger : private juce::Timer {
+          public:
+              explicit Arranger(SoundFontSynth& synth);
+              ~Arranger();
+
+              void start();
+              void stop();
+              void sendStart();
+              void sendFeatures(int midi, float energy, float confidence,
+                                const juce::String& chord);
+              bool isConnected() const { return connected.load(); }
+
+          private:
+              struct Event {
+                  double at = 0;
+                  double off = 0;
+                  int note = 60;
+                  int velocity = 80;
+                  int channel = 0;
+              };
+
+              void timerCallback() override;
+              void receive(const std::string& data);
+              void schedule(const juce::var& payload);
+
+              SoundFontSynth& synth;
+              ix::WebSocket socket;
+              std::atomic<bool> connected {false};
+              std::atomic<bool> active {false};
+              std::mutex eventMutex;
+              std::vector<Event> events;
+              juce::uint64 epoch = 0;
+              double barLength = 2666.0;
+          };
+          EOF
+
+          cat > Source/Arranger.cpp <<'EOF'
+          #include "Arranger.h"
+          #include "Config.h"
+
+          Arranger::Arranger(SoundFontSynth& s) : synth(s) {}
+
+          Arranger::~Arranger() {
+              stop();
+          }
+
+          void Arranger::start() {
+              socket.setUrl(AI_LIVE_BAND_SERVER_URL);
+              socket.setPingInterval(20);
+              socket.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
+                  if (msg->type == ix::WebSocketMessageType::Open) {
+                      connected.store(true);
+                  } else if (msg->type == ix::WebSocketMessageType::Close ||
+                             msg->type == ix::WebSocketMessageType::Error) {
+                      connected.store(false);
+                  } else if (msg->type == ix::WebSocketMessageType::Message) {
+                      receive(msg->str);
+                  }
+              });
+              socket.start();
+              startTimerHz(100);
+          }
+
+          void Arranger::stop() {
+              active.store(false);
+              stopTimer();
+              socket.stop();
+              connected.store(false);
+              std::lock_guard<std::mutex> guard(eventMutex);
+              events.clear();
+          }
+
+          void Arranger::sendStart() {
+              if (!connected.load()) return;
+              juce::DynamicObject::Ptr object = new juce::DynamicObject();
+              object->setProperty("type", "start");
+              object->setProperty("style", "Gospel");
+              object->setProperty("key", "C");
+              object->setProperty("chord", "C");
+              object->setProperty("bpm", 90);
+              socket.send(juce::JSON::toString(juce::var(object.get())).toStdString());
+          }
+
+          void Arranger::sendFeatures(int midi, float energy, float confidence,
+                                      const juce::String& chord) {
+              if (!connected.load() || !active.load()) return;
+
+              juce::DynamicObject::Ptr object = new juce::DynamicObject();
+              object->setProperty("type", "vocal_features");
+              object->setProperty("style", "Gospel");
+              object->setProperty("key", "C");
+              object->setProperty("chord", chord);
+              object->setProperty("bpm", 90);
+              object->setProperty("pitch_hz", midi > 0
+                                  ? 440.0 * std::pow(2.0, (midi - 69) / 12.0)
+                                  : 0.0);
+              object->setProperty("confidence", confidence);
+              object->setProperty("energy", energy);
+              socket.send(juce::JSON::toString(juce::var(object.get())).toStdString());
+          }
+
+          void Arranger::receive(const std::string& data) {
+              auto parsed = juce::JSON::parse(juce::String(data));
+              if (!parsed.isObject()) return;
+
+              auto type = parsed.getProperty("type", "").toString();
+              if (type == "started") {
+                  active.store(true);
+              } else if (type == "stopped") {
+                  active.store(false);
+              } else if (type == "arrangement") {
+                  schedule(parsed);
+              }
+          }
+
+          void Arranger::schedule(const juce::var& payload) {
+              double bpm = (double)payload.getProperty("bpm", 90.0);
+              bpm = juce::jlimit(50.0, 180.0, bpm);
+              barLength = 240000.0 / bpm;
+              epoch = juce::Time::getMillisecondCounterHiRes();
+
+              auto list = payload.getProperty("events", juce::var());
+              if (!list.isArray()) return;
+
+              std::vector<Event> incoming;
+              for (const auto& item : *list.getArray()) {
+                  Event e;
+                  e.at = (double)item.getProperty("time_ms", 0);
+                  e.off = e.at + (double)item.getProperty("duration_ms", 250);
+                  e.note = (int)item.getProperty("note", 60);
+                  e.velocity = (int)item.getProperty("velocity", 80);
+
+                  auto instrument = item.getProperty("instrument", "keys").toString();
+                  if (instrument == "bass") e.channel = 1;
+                  else if (instrument == "lead") e.channel = 2;
+                  else e.channel = 0;
+
+                  incoming.push_back(e);
+              }
+
+              std::lock_guard<std::mutex> guard(eventMutex);
+              events.clear();
+              for (auto& e : incoming) {
+                  e.at += 100.0;
+                  e.off += 100.0;
+                  events.push_back(e);
+              }
+          }
+
+          void Arranger::timerCallback() {
+              if (!active.load()) return;
+
+              double now = juce::Time::getMillisecondCounterHiRes() - epoch;
+              std::vector<Event> dueOn;
+              std::vector<Event> dueOff;
+
+              {
+                  std::lock_guard<std::mutex> guard(eventMutex);
+                  for (auto it = events.begin(); it != events.end();) {
+                      if (it->at <= now) {
+                          dueOn.push_back(*it);
+                          it = events.erase(it);
+                      } else {
+                          ++it;
+                      }
+                  }
+
+                  for (auto it = events.begin(); it != events.end();) {
+                      if (it->off <= now) {
+                          dueOff.push_back(*it);
+                          it = events.erase(it);
+                      } else {
+                          ++it;
+                      }
+                  }
+              }
+
+              for (const auto& e : dueOn)
+                  synth.noteOn(e.channel, e.note, e.velocity / 127.0f);
+              for (const auto& e : dueOff)
+                  synth.noteOff(e.channel, e.note);
+          }
+          EOF
+
+          cat > Source/MainComponent.h <<'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          #include "PitchDetector.h"
+          #include "ChordInference.h"
+          #include "SoundFontSynth.h"
+          #include "Arranger.h"
+          #include <atomic>
+          #include <vector>
+
+          class MainComponent : public juce::Component,
+                                public juce::AudioIODeviceCallback,
+                                private juce::Timer {
+          public:
+              MainComponent();
+              ~MainComponent() override;
+              void paint(juce::Graphics&) override;
+              void resized() override;
+
+              void audioDeviceIOCallbackWithContext(
+                  const float* const*, int, float* const*, int, int,
+                  const juce::AudioIODeviceCallbackContext&) override;
+              void audioDeviceAboutToStart(juce::AudioIODevice*) override;
+              void audioDeviceStopped() override;
+
+          private:
+              void timerCallback() override;
+              void startPerformance();
+              void stopPerformance();
+
+              juce::AudioDeviceManager devices;
+              std::unique_ptr<PitchDetector> detector;
+              ChordInference chords;
+              SoundFontSynth synth;
+              std::unique_ptr<Arranger> arranger;
+
+              juce::Label status, note, chord;
+              juce::TextButton startButton {"Start Performance"};
+              juce::TextButton testButton {"Test Sound"};
+              juce::TextButton settingsButton {"Audio Settings"};
+
+              std::atomic<float> frequency {0};
+              std::atomic<float> confidence {0};
+              std::atomic<float> energy {0};
+              std::atomic<int> lastMidi {0};
+
+              std::vector<float> analysisBuffer;
+              int analysisPosition = 0;
+              JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
+          };
+          EOF
+
+          cat > Source/MainComponent.cpp <<'EOF'
+          #include "MainComponent.h"
+
+          MainComponent::MainComponent() {
+              setSize(700, 600);
+              addAndMakeVisible(status);
+              addAndMakeVisible(note);
+              addAndMakeVisible(chord);
+              addAndMakeVisible(startButton);
+              addAndMakeVisible(testButton);
+              addAndMakeVisible(settingsButton);
+
+              status.setText("AFRINODE AI LIVE BAND", juce::dontSendNotification);
+              status.setJustificationType(juce::Justification::centred);
+              status.setFont(juce::Font(juce::FontOptions(26.0f, juce::Font::bold)));
+
+              note.setJustificationType(juce::Justification::centred);
+              note.setFont(juce::Font(juce::FontOptions(48.0f)));
+              chord.setJustificationType(juce::Justification::centred);
+              chord.setFont(juce::Font(juce::FontOptions(32.0f)));
+
+              startButton.onClick = [this] {
+                  if (devices.getCurrentAudioDevice()) stopPerformance();
+                  else {
+                      if (!juce::RuntimePermissions::isGranted(
+                              juce::RuntimePermissions::recordAudio)) {
+                          juce::RuntimePermissions::request(
+                              juce::RuntimePermissions::recordAudio,
+                              [this](bool granted) {
+                                  if (granted) startPerformance();
+                                  else status.setText("Microphone permission denied",
+                                                      juce::dontSendNotification);
+                              });
+                      } else startPerformance();
+                  }
+              };
+
+              testButton.onClick = [this] {
+                  if (!devices.getCurrentAudioDevice()) return;
+                  synth.noteOn(0, 60, 0.8f);
+                  juce::Timer::callAfterDelay(500, [this] {
+                      synth.noteOff(0, 60);
+                  });
+              };
+
+              settingsButton.onClick = [this] {
+                  auto* selector = new juce::AudioDeviceSelectorComponent(
+                      devices, 1, 2, 1, 2, false, false, true, false);
+                  selector->setSize(500, 400);
+                  juce::DialogWindow::LaunchOptions options;
+                  options.content.setOwned(selector);
+                  options.dialogTitle = "Audio Settings";
+                  options.dialogBackgroundColour = juce::Colours::darkgrey;
+                  options.useNativeTitleBar = true;
+                  options.launchAsync();
+              };
+
+              startTimerHz(30);
+          }
+
+          MainComponent::~MainComponent() {
+              stopTimer();
+              stopPerformance();
+          }
+
+          void MainComponent::startPerformance() {
+              if (devices.getCurrentAudioDevice()) return;
+
+              auto error = devices.initialiseWithDefaultDevices(1, 2);
+              if (error.isNotEmpty()) {
+                  status.setText(error, juce::dontSendNotification);
+                  return;
+              }
+
+              arranger = std::make_unique<Arranger>(synth);
+              devices.addAudioCallback(this);
+              if (arranger) arranger->start();
+
+              startButton.setButtonText("Stop Performance");
+              status.setText("CONNECTING TO AFRINODE SERVER",
+                             juce::dontSendNotification);
+          }
+
+          void MainComponent::stopPerformance() {
+              if (devices.getCurrentAudioDevice()) {
+                  devices.removeAudioCallback(this);
+                  devices.closeAudioDevice();
+              }
+              if (arranger) {
+                  arranger->stop();
+                  arranger.reset();
+              }
+              startButton.setButtonText("Start Performance");
+              status.setText("STOPPED", juce::dontSendNotification);
+          }
+
+          void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* device) {
+              detector = std::make_unique<PitchDetector>(device->getCurrentSampleRate());
+              synth.initialize(device->getCurrentSampleRate());
+              analysisBuffer.assign(4096, 0.0f);
+              analysisPosition = 0;
+              if (arranger) arranger->sendStart();
+          }
+
+          void MainComponent::audioDeviceStopped() {
+              detector.reset();
+          }
+
+          void MainComponent::audioDeviceIOCallbackWithContext(
+              const float* const* inputs, int inputCount,
+              float* const* outputs, int outputCount, int samples,
+              const juce::AudioIODeviceCallbackContext&) {
+
+              if (inputCount > 0 && inputs && inputs[0] && detector) {
+                  double rms = 0.0;
+                  for (int i = 0; i < samples; ++i) {
+                      float x = inputs[0][i];
+                      rms += x * x;
+
+                      analysisBuffer[analysisPosition++] = x;
+                      if (analysisPosition >= (int)analysisBuffer.size()) {
+                          float conf = 0.0f;
+                          float freq = detector->detect(
+                              analysisBuffer.data(),
+                              (int)analysisBuffer.size(), conf);
+
+                          confidence.store(conf);
+                          frequency.store(freq);
+                          energy.store((float)std::sqrt(rms / juce::jmax(1, samples)));
+
+                          int midi = PitchDetector::freqToMidi(freq);
+                          if (freq > 0 && conf > 0.45f) {
+                              lastMidi.store(midi);
+                              chords.addNote(midi);
+                          }
+
+                          if (arranger)
+                              arranger->sendFeatures(midi, energy.load(),
+                                                     conf, chords.getChord());
+
+                          analysisPosition = 0;
+                          rms = 0.0;
+                      }
+                  }
+              }
+
+              if (outputCount > 0 && outputs && outputs[0]) {
+                  synth.render(outputs[0],
+                               outputCount > 1 ? outputs[1] : nullptr,
+                               samples);
+              }
+
+              for (int ch = 2; ch < outputCount; ++ch)
+                  if (outputs[ch])
+                      juce::FloatVectorOperations::clear(outputs[ch], samples);
+          }
+
+          void MainComponent::timerCallback() {
+              float f = frequency.load();
+              if (f > 0) note.setText(PitchDetector::freqToNote(f),
+                                      juce::dontSendNotification);
+              else note.setText("-", juce::dontSendNotification);
+
+              chord.setText(chords.getChord(), juce::dontSendNotification);
+
+              if (arranger && arranger->isConnected())
+                  status.setText("CONNECTED - LISTENING",
+                                 juce::dontSendNotification);
+              else if (devices.getCurrentAudioDevice())
+                  status.setText("WAITING FOR SERVER",
+                                 juce::dontSendNotification);
+          }
+
+          void MainComponent::paint(juce::Graphics& g) {
+              g.fillAll(juce::Colour::fromRGB(10, 12, 18));
+              g.setColour(juce::Colour::fromRGB(0, 220, 180));
+              g.drawRoundedRectangle(getLocalBounds().toFloat().reduced(8),
+                                     12.0f, 2.0f);
+          }
+
+          void MainComponent::resized() {
+              auto area = getLocalBounds().reduced(25);
+              status.setBounds(area.removeFromTop(70));
+              note.setBounds(area.removeFromTop(110));
+              chord.setBounds(area.removeFromTop(80));
+              area.removeFromTop(40);
+              startButton.setBounds(area.removeFromTop(60).reduced(10));
+              testButton.setBounds(area.removeFromTop(60).reduced(10));
+              settingsButton.setBounds(area.removeFromTop(60).reduced(10));
+          }
+          EOF
+
+          cat > Source/Main.cpp <<'EOF'
+          #include <JuceHeader.h>
+          #include "MainComponent.h"
+
+          class AILiveBandApplication : public juce::JUCEApplication {
+          public:
+              const juce::String getApplicationName() override { return "AI Live Band"; }
+              const juce::String getApplicationVersion() override { return "1.0.0"; }
+              bool moreThanOneInstanceAllowed() override { return true; }
+
+              void initialise(const juce::String&) override {
+                  window.reset(new MainWindow());
+              }
+
+              void shutdown() override { window.reset(); }
+              void systemRequestedQuit() override { quit(); }
+
+              class MainWindow : public juce::DocumentWindow {
+              public:
+                  MainWindow() : DocumentWindow(
+                      "AI Live Band", juce::Colours::black,
+                      #if JUCE_ANDROID
+                      0
+                      #else
+                      DocumentWindow::allButtons
+                      #endif
+                  ) {
+                      setContentOwned(new MainComponent(), true);
+                      #if JUCE_ANDROID
+                      setFullScreen(true);
+                      #else
+                      setUsingNativeTitleBar(true);
+                      setResizable(true, true);
+                      centreWithSize(700, 600);
+                      #endif
+                      setVisible(true);
+                  }
+
+                  void closeButtonPressed() override {
+                      JUCEApplication::getInstance()->systemRequestedQuit();
+                  }
+              };
+
+          private:
+              std::unique_ptr<MainWindow> window;
+          };
+
+          START_JUCE_APPLICATION(AILiveBandApplication)
+          EOF
+
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22)
+          project(AILiveBand VERSION 1.0.0 LANGUAGES C CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
+          add_subdirectory(JUCE)
+
+          include(FetchContent)
+          FetchContent_Declare(ixwebsocket
+            GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
+            GIT_TAG v11.4.4)
+          set(USE_TLS OFF CACHE BOOL "" FORCE)
+          set(USE_ZLIB OFF CACHE BOOL "" FORCE)
+          set(USE_TEST OFF CACHE BOOL "" FORCE)
+          set(USE_WS ON CACHE BOOL "" FORCE)
+          set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+          FetchContent_MakeAvailable(ixwebsocket)
+
+          juce_add_binary_data(BinaryData SOURCES Source/SoundFont.sf2)
+
+          juce_add_gui_app(AILiveBand
+            PRODUCT_NAME "AI Live Band"
+            COMPANY_NAME "AFRINODE"
+            VERSION "1.0.0"
+            MICROPHONE_PERMISSION_ENABLED TRUE
+            MICROPHONE_PERMISSION_TEXT "AI Live Band needs microphone access.")
+
+          juce_generate_juce_header(AILiveBand)
+
+          target_sources(AILiveBand PRIVATE
+            Source/Main.cpp
+            Source/MainComponent.cpp
+            Source/PitchDetector.cpp
+            Source/ChordInference.cpp
+            Source/SoundFontSynth.cpp
+            Source/Arranger.cpp)
+
+          target_include_directories(AILiveBand PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/Source")
+
+          target_compile_definitions(AILiveBand PRIVATE
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0
+            JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:AILiveBand,JUCE_PRODUCT_NAME>"
+            JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:AILiveBand,JUCE_VERSION>")
+
+          target_link_libraries(AILiveBand PRIVATE
+            BinaryData
+            ixwebsocket
+            juce::juce_audio_utils
+            juce::juce_audio_devices
+            juce::juce_dsp
+            juce::juce_gui_extra
+            juce::juce_recommended_config_flags
+            juce::juce_recommended_warning_flags)
+          EOF
+
+          cat > AILiveBand.jucer <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <JUCERPROJECT id="AILiveBand" name="AILiveBand"
+            projectType="guiapp" version="1.0.0"
+            companyName="AFRINODE" bundleIdentifier="com.afrinode.ailiveband">
+            <MAINGROUP id="m" name="AI Live Band">
+              <GROUP id="g" name="Source">
+                <FILE id="f1" name="Main.cpp" compile="1" resource="0" file="Source/Main.cpp"/>
+                <FILE id="f2" name="MainComponent.cpp" compile="1" resource="0" file="Source/MainComponent.cpp"/>
+                <FILE id="f3" name="MainComponent.h" compile="0" resource="0" file="Source/MainComponent.h"/>
+                <FILE id="f4" name="PitchDetector.cpp" compile="1" resource="0" file="Source/PitchDetector.cpp"/>
+                <FILE id="f5" name="PitchDetector.h" compile="0" resource="0" file="Source/PitchDetector.h"/>
+                <FILE id="f6" name="ChordInference.cpp" compile="1" resource="0" file="Source/ChordInference.cpp"/>
+                <FILE id="f7" name="ChordInference.h" compile="0" resource="0" file="Source/ChordInference.h"/>
+                <FILE id="f8" name="SoundFontSynth.cpp" compile="1" resource="0" file="Source/SoundFontSynth.cpp"/>
+                <FILE id="f9" name="SoundFontSynth.h" compile="0" resource="0" file="Source/SoundFontSynth.h"/>
+                <FILE id="f10" name="Arranger.cpp" compile="1" resource="0" file="Source/Arranger.cpp"/>
+                <FILE id="f11" name="Arranger.h" compile="0" resource="0" file="Source/Arranger.h"/>
+                <FILE id="f12" name="ChordInference.cpp" compile="1" resource="0" file="Source/ChordInference.cpp"/>
+                <FILE id="f13" name="Config.h" compile="0" resource="0" file="Source/Config.h"/>
+                <FILE id="f14" name="tsf.h" compile="0" resource="0" file="Source/tsf.h"/>
+              </GROUP>
+              <GROUP id="g2" name="Resources">
+                <FILE id="f15" name="SoundFont.sf2" compile="0" resource="1" file="Source/SoundFont.sf2"/>
+              </GROUP>
+            </MAINGROUP>
+            <MODULES>
+              <MODULE id="juce_core" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_events" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_graphics" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_data_structures" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_gui_basics" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_gui_extra" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_audio_basics" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_audio_devices" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_audio_formats" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_audio_processors" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_audio_utils" showAllCode="1" useGlobalPath="1"/>
+              <MODULE id="juce_dsp" showAllCode="1" useGlobalPath="1"/>
+            </MODULES>
+            <JUCEOPTIONS JUCE_WEB_BROWSER="0" JUCE_USE_CURL="0"/>
+            <EXPORTFORMATS>
+              <ANDROIDSTUDIO targetFolder="Builds/Android"
+                minSdkVersion="24" androidMicNeeded="1"
+                androidInternetNeeded="1"/>
+            </EXPORTFORMATS>
+          </JUCERPROJECT>
+          EOF
+
+      - name: Upload source package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AILiveBand-source
+          path: |
+            Source/
+            CMakeLists.txt
+            AILiveBand.jucer
+
+  build-linux:
+    needs: scaffold
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: AILiveBand-source
+      - uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: ${{ env.JUCE_VERSION }}
+          path: JUCE
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            libasound2-dev libjack-jackd2-dev ladspa-sdk libcurl4-openssl-dev \
+            libfreetype6-dev libfontconfig1-dev libx11-dev libxcomposite-dev \
+            libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev \
+            libxrender-dev libxi-dev libglu1-mesa-dev mesa-common-dev libegl-dev
+      - name: Build Linux
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j2
+      - name: Package Linux
+        run: |
+          tar -czf AILiveBand-linux.tar.gz \
+            -C build/AILiveBand_artefacts/Release "AI Live Band"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AILiveBand-linux
+          path: AILiveBand-linux.tar.gz
+
+  build-windows:
+    needs: scaffold
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: AILiveBand-source
+      - uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: ${{ env.JUCE_VERSION }}
+          path: JUCE
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Build Windows
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AILiveBand-windows
+          path: build/AILiveBand_artefacts/Release/AI Live Band.exe
+
+  build-macos:
+    needs: scaffold
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: AILiveBand-source
+      - uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: ${{ env.JUCE_VERSION }}
+          path: JUCE
+      - name: Install Ninja
+        run: brew install ninja
+      - name: Build macOS
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          cmake --build build --config Release -j2
+      - name: Package macOS
+        run: |
+          tar -czf AILiveBand-macos.tar.gz \
+            -C build/AILiveBand_artefacts/Release "AI Live Band.app"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AILiveBand-macos
+          path: AILiveBand-macos.tar.gz
+
+  build-android:
+    needs: scaffold
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: AILiveBand-source
+
+      - uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: ${{ env.JUCE_VERSION }}
+          path: JUCE
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK and NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Install Projucer build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build \
+            libx11-dev libxext-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libfreetype6-dev libfontconfig1-dev \
+            libasound2-dev libjack-jackd2-dev ladspa-sdk
+
+      - name: Build IXWebSocket for Android ABIs
+        run: |
+          git clone --depth 1 --branch v11.4.4 \
+            https://github.com/machinezone/IXWebSocket.git ixwebsocket-src
+
+          NDK_TOOLCHAIN="$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}/build/cmake/android.toolchain.cmake"
+          mkdir -p ixwebsocket-android/libs ixwebsocket-android/include
+
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            cmake -S ixwebsocket-src -B "ixwebsocket-src/build-${ABI}" \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
+              -DANDROID_ABI="$ABI" \
+              -DANDROID_PLATFORM=android-24 \
+              -DUSE_TLS=OFF \
+              -DUSE_ZLIB=OFF \
+              -DUSE_TEST=OFF \
+              -DUSE_WS=ON \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+              -DCMAKE_BUILD_TYPE=Release
+
+            cmake --build "ixwebsocket-src/build-${ABI}" \
+              --target ixwebsocket -j2
+
+            mkdir -p "ixwebsocket-android/libs/${ABI}"
+            find "ixwebsocket-src/build-${ABI}" -name "libixwebsocket.a" \
+              -exec cp {} "ixwebsocket-android/libs/${ABI}/" \;
+
+            test -f "ixwebsocket-android/libs/${ABI}/libixwebsocket.a"
+          done
+
+          cp -r ixwebsocket-src/ixwebsocket ixwebsocket-android/include/
+
+      - name: Build Projucer
+        run: |
+          cd JUCE/extras/Projucer/Builds/LinuxMakefile
+          make -j2 CONFIG=Release
+          echo "$GITHUB_WORKSPACE/JUCE/extras/Projucer/Builds/LinuxMakefile/build" >> "$GITHUB_PATH"
+
+      - name: Generate Android project
+        run: |
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          Projucer --set-global-search-path linux defaultJuceModulePath "$GITHUB_WORKSPACE/JUCE/modules"
+          Projucer --set-global-search-path linux androidSDKPath "$ANDROID_HOME"
+          Projucer --resave AILiveBand.jucer
+
+          test -f Builds/Android/app/CMakeLists.txt
+          test -f Builds/Android/gradlew
+
+      - name: Patch Android project
+        run: |
+          set -e
+          CMAKE_FILE="Builds/Android/app/CMakeLists.txt"
+          MANIFEST="Builds/Android/app/src/main/AndroidManifest.xml"
+
+          python3 - "$CMAKE_FILE" "$GITHUB_WORKSPACE" <<'PY'
           import sys
-          import unittest
+          path, root = sys.argv[1], sys.argv[2]
+          text = open(path).read()
 
-          sys.path.insert(
-              0,
-              os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "server"))
-          )
-
-          from app import make_arrangement
-
-          class ArrangementTests(unittest.TestCase):
-              def test_arrangement_has_events(self):
-                  result = make_arrangement({
-                      "style": "Gospel",
-                      "key": "C",
-                      "chord": "C",
-                      "bpm": 90
-                  })
-                  self.assertEqual(result["type"], "arrangement")
-                  self.assertGreater(len(result["events"]), 0)
-
-              def test_bpm_is_limited(self):
-                  result = make_arrangement({"bpm": 500})
-                  self.assertEqual(result["bpm"], 180)
-
-              def test_unknown_key_uses_c(self):
-                  result = make_arrangement({"key": "UNKNOWN"})
-                  self.assertEqual(result["key"], "C")
-
-          if __name__ == "__main__":
-              unittest.main()
+          if "ixwebsocket-android" not in text:
+              text += f'''
+          include_directories("{root}/ixwebsocket-android/include")
+          add_library(ixwebsocket STATIC IMPORTED)
+          set_target_properties(ixwebsocket PROPERTIES
+            IMPORTED_LOCATION "{root}/ixwebsocket-android/libs/${{ANDROID_ABI}}/libixwebsocket.a")
+          '''
+              text += '''
+          if(TARGET AILiveBand)
+            target_link_libraries(AILiveBand PRIVATE ixwebsocket)
+          endif()
+          '''
+          open(path, "w").write(text)
           PY
 
-          cat > docs/SERVER_PROTOCOL.md <<'EOF'
-          # AfriNode Live Band - Server Protocol
+          for PERM in RECORD_AUDIO INTERNET; do
+            grep -q "android.permission.$PERM" "$MANIFEST" || \
+              sed -i "/<application/i\\    <uses-permission android:name=\\"android.permission.$PERM\\" />" "$MANIFEST"
+          done
 
-          Transport: WebSocket
-          Protocol: afrinode-live-band-v1
+          grep -q usesCleartextTraffic "$MANIFEST" || \
+            sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MANIFEST"
 
-          Android sends JSON messages:
-          - `start`
-          - `vocal_features`
-          - `stop`
-          - `ping`
-
-          Server returns JSON messages:
-          - `connected`
-          - `started`
-          - `arrangement`
-          - `stopped`
-          - `pong`
-          - `error`
-
-          Arrangement events are MIDI instructions, not audio samples.
-          Android must schedule each event at its `time_ms`, trigger the
-          corresponding instrument, and stop the note after `duration_ms`.
-          The server's event times are relative to the beginning of each bar.
-          EOF
-
-      - name: Install server dependencies
+      - name: Build Android APK
         run: |
-          python -m pip install --upgrade pip
-          pip install -r server/requirements.txt
+          cd Builds/Android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Test generated server
+      - name: Find and copy APK
         run: |
-          python -m unittest discover -s tests -v
+          APK=$(find Builds/Android -type f -name "*debug*.apk" | head -n 1)
+          test -n "$APK"
+          cp "$APK" "$GITHUB_WORKSPACE/AILiveBand.apk"
 
-      - name: Commit generated files
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add server tests docs
-          if git diff --cached --quiet; then
-            echo "No generated changes to commit."
-          else
-            git commit -m "Generate AfriNode Live Band server files"
-            git push
-          fi
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AILiveBand-android
+          path: AILiveBand.apk
+          if-no-files-found: error
