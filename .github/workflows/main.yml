@@ -48,12 +48,6 @@ jobs:
             exit 1
           fi
 
-          REPO_SF2="assets/SoundFont.sf2"
-          if [ ! -f "$REPO_SF2" ]; then
-            echo "::error::Required SoundFont file '$REPO_SF2' is missing from the repository."
-            exit 1
-          fi
-
           cat > verify_sf2.py <<'PY'
           import os
           import struct
@@ -122,13 +116,28 @@ jobs:
               sys.exit(1)
           PY
 
-          if ! python3 verify_sf2.py "$REPO_SF2"; then
-            echo "::error::Repository SoundFont '$REPO_SF2' failed SF2 validation."
-            exit 1
+          REPO_SF2="assets/SoundFont.sf2"
+          if [ -f "$REPO_SF2" ]; then
+            python3 verify_sf2.py "$REPO_SF2"
+            cp "$REPO_SF2" SoundFont.sf2
+            echo "OK: Validated and staged $REPO_SF2"
+          else
+            echo "assets/SoundFont.sf2 not in repo; attempting fallback SoundFont download..."
+            SF2_FALLBACK_URLS="https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/master/GeneralUser-GS.sf2 https://github.com/mrbumpy409/GeneralUser-GS/raw/main/GeneralUser-GS.sf2"
+            got_sf2=0
+            for sf_url in $SF2_FALLBACK_URLS; do
+              if curl -fsSL --retry 3 --retry-delay 3 -o SoundFont.sf2 "$sf_url" && python3 verify_sf2.py SoundFont.sf2; then
+                echo "OK: Downloaded and validated fallback SoundFont from $sf_url"
+                got_sf2=1
+                break
+              fi
+              rm -f SoundFont.sf2
+            done
+            if [ "$got_sf2" != "1" ]; then
+              echo "::error::No valid SoundFont found at assets/SoundFont.sf2 and fallback download failed."
+              exit 1
+            fi
           fi
-
-          cp "$REPO_SF2" SoundFont.sf2
-          echo "OK: Validated and staged $REPO_SF2"
 
       - name: Create project files
         run: |
@@ -291,7 +300,6 @@ jobs:
           static const char* const GM_KEYS[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
           EOF
 
-          # ── PitchDetector: downsampled to ~12-16 kHz before YIN for fast mobile execution ──
           cat > Source/PitchDetector.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
@@ -368,7 +376,6 @@ jobs:
 
           void PitchDetector::prepare(double sampleRate) {
               inputSr = juce::jmax(8000.0, sampleRate);
-              // Target ~12-16 kHz analysis rate (e.g. 48000 / 3 = 16000 Hz, 44100 / 3 = 14700 Hz)
               int factor = (int)std::llround(inputSr / 14500.0);
               decimFactor = juce::jlimit(1, 8, factor);
               analysisSr = inputSr / (double)decimFactor;
@@ -386,7 +393,6 @@ jobs:
 
           void PitchDetector::feed(const float* s, int n) {
               if (!s || n <= 0) return;
-              // Box-average decimation by decimFactor to reduce aliasing before YIN
               const int df = juce::jmax(1, decimFactor);
               const int64_t wp = writePos.load(std::memory_order_relaxed);
               int64_t outIdx = wp;
@@ -1828,7 +1834,6 @@ jobs:
           }
           EOF
 
-          # ── MainComponent: create/recreate detector on UI thread after device opens; display detector SR ──
           cat > Source/MainComponent.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
@@ -2123,7 +2128,6 @@ jobs:
 
               audioSessionActive.store(true, std::memory_order_release);
 
-              // Read the actual opened device sample rate after initialisation
               double openedSr = currentSampleRate.load(std::memory_order_acquire);
               if (auto* dev = deviceManager.getCurrentAudioDevice()) {
                   const double devSr = dev->getCurrentSampleRate();
@@ -2174,8 +2178,6 @@ jobs:
               if (audioSessionActive.load(std::memory_order_acquire)) {
                   PitchDetector* det = activeDetector.load(std::memory_order_acquire);
                   if (det == nullptr || std::abs(det->getInputSampleRate() - sr) >= 0.5) {
-                      // Detach current detector immediately so audio thread never feeds mismatched rate,
-                      // and recreate on the UI thread with the new sample rate.
                       activeDetector.store(nullptr, std::memory_order_release);
                       scheduleDetectorRecreateOnUiThread(sr);
                   }
