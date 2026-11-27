@@ -1,14 +1,10 @@
-
-name: Build AfriNode AI Live Band
+name: Build AI Live Band App
 
 on:
   push:
-    branches: [main, master, first-prototype]
+    branches: [ main, master, first-prototype ]
   pull_request:
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,772 +13,103 @@ concurrency:
 env:
   JUCE_VERSION: 8.0.6
   ANDROID_NDK_VERSION: 26.3.11579264
-  SERVER_URL: ws://13.140.90.83:8765
 
 jobs:
   scaffold:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Download SoundFont
-        shell: bash
+      - name: Download SoundFont and TinySoundFont
+        env:
+          GM_SOUNDFONT_URL: ${{ vars.GM_SOUNDFONT_URL }}
         run: |
-          set -e
-          mkdir -p Source
+          set -euo pipefail
 
-          curl -fL --retry 3 \
+          if [ -z "${GM_SOUNDFONT_URL:-}" ]; then
+            echo "::error::Repository variable GM_SOUNDFONT_URL is not set."
+            echo "::error::Set GM_SOUNDFONT_URL to a direct HTTPS URL for a General MIDI SF2 file under 20 MB."
+            exit 1
+          fi
+
+          download() {
+            out="$1"; shift
+            for url in "$@"; do
+              if curl -fsSL --retry 3 --retry-delay 3 -o "$out" "$url"; then
+                echo "Downloaded $out from $url"; return 0
+              fi
+              echo "Failed: $url"
+            done
+            return 1
+          }
+
+          download tsf.h \
+            https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h \
             https://raw.githubusercontent.com/schellingb/TinySoundFont/HEAD/tsf.h \
-            -o Source/tsf.h
+            https://raw.githubusercontent.com/schellingb/TinySoundFont/main/tsf.h \
+            || { echo "::error::Could not download tsf.h"; exit 1; }
 
-          curl -fL --retry 3 \
-            https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2 \
-            -o Source/SoundFont.sf2
+          grep -q TSF_IMPLEMENTATION tsf.h || { echo "::error::tsf.h is not valid"; exit 1; }
 
-          grep -q TSF_IMPLEMENTATION Source/tsf.h
-          test "$(head -c 4 Source/SoundFont.sf2)" = "RIFF"
+          verify_sf2() {
+            python3 - "$1" <<'PY'
+          import os, struct, sys
+          try:
+              path = sys.argv[1]
+              max_bytes = 20 * 1024 * 1024
+              size = os.path.getsize(path)
+              if size >= max_bytes:
+                  print(f"SoundFont size {size} bytes exceeds 20 MB limit ({max_bytes} bytes)")
+                  sys.exit(1)
 
-      - name: Generate application sources
-        shell: bash
+              data = open(path, 'rb').read()
+              if len(data) < 12 or data[:4] != b'RIFF' or data[8:12] != b'sfbk':
+                  print("Not an SF2"); sys.exit(1)
+              idx = data.find(b'LIST')
+              while idx >= 0:
+                  if data[idx+8:idx+12] == b'pdta': break
+                  idx = data.find(b'LIST', idx + 12)
+              if idx < 0: print("No pdta"); sys.exit(1)
+              pos = idx + 12
+              end = idx + 8 + struct.unpack('<I', data[idx+4:idx+8])[0]
+              presets = set(); has_drum = False
+              while pos < end:
+                  ct = data[pos:pos+4]
+                  cs = struct.unpack('<I', data[pos+4:pos+8])[0]
+                  if ct == b'phdr':
+                      n = (cs // 38) - 1
+                      phdr = data[pos+8:pos+8+cs]
+                      for i in range(n):
+                          o = i * 38
+                          preset = struct.unpack('<H', phdr[o+20:o+22])[0]
+                          bank   = struct.unpack('<H', phdr[o+22:o+24])[0]
+                          if bank == 0 and preset < 128: presets.add(preset)
+                          if bank == 128: has_drum = True
+                  pos += 8 + cs
+              print(f"GM presets: {len(presets)}/128, drums: {has_drum}, size: {size} bytes")
+              sys.exit(0 if (len(presets) >= 128 and has_drum) else 1)
+          except SystemExit: raise
+          except Exception as e: print(f"Parse error: {e}"); sys.exit(1)
+          PY
+          }
+
+          curl -fsSL --retry 3 --retry-delay 3 -o SoundFont.sf2 "$GM_SOUNDFONT_URL" \
+            || { echo "::error::Could not download SoundFont from GM_SOUNDFONT_URL"; exit 1; }
+
+          verify_sf2 SoundFont.sf2 \
+            || { echo "::error::SoundFont from GM_SOUNDFONT_URL failed validation (must be <20MB with all 128 GM presets and drums)."; exit 1; }
+          echo "OK: Validated GM SoundFont under 20 MB."
+
+      - name: Create project files
         run: |
-          set -e
-
-          cat > Source/Config.h <<'EOF'
-          #pragma once
-          #define AI_LIVE_BAND_SERVER_URL "ws://13.140.90.83:8765"
-          #define AI_LIVE_BAND_PROTOCOL "afrinode-live-band-v1"
-          EOF
-
-          cat > Source/PitchDetector.h <<'EOF'
-          #pragma once
-          #include <JuceHeader.h>
-
-          class PitchDetector {
-          public:
-              explicit PitchDetector(double sampleRate);
-              float detect(const float* samples, int count, float& confidence);
-              static int freqToMidi(float frequency);
-              static juce::String freqToNote(float frequency);
-          private:
-              double sampleRate;
-          };
-          EOF
-
-          cat > Source/PitchDetector.cpp <<'EOF'
-          #include "PitchDetector.h"
-
-          PitchDetector::PitchDetector(double rate) : sampleRate(rate) {}
-
-          float PitchDetector::detect(const float* samples, int count, float& confidence) {
-              confidence = 0.0f;
-              if (!samples || count < 256 || sampleRate <= 0) return 0.0f;
-
-              double mean = 0.0;
-              for (int i = 0; i < count; ++i) mean += samples[i];
-              mean /= count;
-
-              double energy = 0.0;
-              for (int i = 0; i < count; ++i) {
-                  double x = samples[i] - mean;
-                  energy += x * x;
-              }
-
-              if (energy < 0.00001) return 0.0f;
-
-              int minLag = juce::jmax(1, (int)(sampleRate / 1000.0));
-              int maxLag = juce::jmin(count / 2, (int)(sampleRate / 65.0));
-
-              int bestLag = 0;
-              double best = 0.0;
-
-              for (int lag = minLag; lag <= maxLag; ++lag) {
-                  double corr = 0.0;
-                  double normA = 0.0;
-                  double normB = 0.0;
-
-                  for (int i = 0; i < count - lag; ++i) {
-                      double a = samples[i] - mean;
-                      double b = samples[i + lag] - mean;
-                      corr += a * b;
-                      normA += a * a;
-                      normB += b * b;
-                  }
-
-                  double normalized = corr / std::sqrt(normA * normB + 1.0e-12);
-                  if (normalized > best) {
-                      best = normalized;
-                      bestLag = lag;
-                  }
-              }
-
-              confidence = (float)best;
-              if (bestLag == 0 || best < 0.45) return 0.0f;
-              return (float)(sampleRate / bestLag);
-          }
-
-          int PitchDetector::freqToMidi(float frequency) {
-              if (frequency <= 0) return 0;
-              return (int)std::round(69.0 + 12.0 * std::log2(frequency / 440.0));
-          }
-
-          juce::String PitchDetector::freqToNote(float frequency) {
-              if (frequency <= 0) return "-";
-              static const char* names[] = {
-                  "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
-              };
-              int midi = freqToMidi(frequency);
-              return juce::String(names[midi % 12]) + juce::String(midi / 12 - 1);
-          }
-          EOF
-
-          cat > Source/ChordInference.h <<'EOF'
-          #pragma once
-          #include <JuceHeader.h>
-          #include <array>
-          #include <atomic>
-
-          class ChordInference {
-          public:
-              void addNote(int midi);
-              juce::String getChord() const;
-              void clear();
-          private:
-              std::array<std::atomic<int>, 12> counts {};
-              std::atomic<int> cursor {0};
-              std::array<int, 12> history {};
-          };
-          EOF
-
-          cat > Source/ChordInference.cpp <<'EOF'
-          #include "ChordInference.h"
-
-          void ChordInference::addNote(int midi) {
-              if (midi <= 0) return;
-              int pc = midi % 12;
-              int position = cursor.fetch_add(1) % 12;
-              if (history[position] >= 0) counts[history[position]].fetch_sub(1);
-              history[position] = pc;
-              counts[pc].fetch_add(1);
-          }
-
-          void ChordInference::clear() {
-              for (auto& c : counts) c.store(0);
-              history.fill(-1);
-              cursor.store(0);
-          }
-
-          juce::String ChordInference::getChord() const {
-              static const char* roots[] = {
-                  "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
-              };
-              static const int major[] = {0,4,7};
-              static const int minor[] = {0,3,7};
-
-              int bestRoot = 0;
-              int bestScore = -9999;
-              bool bestMinor = false;
-
-              for (int root = 0; root < 12; ++root) {
-                  for (int q = 0; q < 2; ++q) {
-                      const int* intervals = q ? minor : major;
-                      int score = 0;
-                      for (int pc = 0; pc < 12; ++pc) {
-                          bool included = false;
-                          for (int i = 0; i < 3; ++i)
-                              if ((root + intervals[i]) % 12 == pc) included = true;
-                          score += counts[pc].load() * (included ? 2 : -1);
-                      }
-                      if (score > bestScore) {
-                          bestScore = score;
-                          bestRoot = root;
-                          bestMinor = q != 0;
-                      }
-                  }
-              }
-
-              return juce::String(roots[bestRoot]) +
-                     (bestMinor ? "m" : "");
-          }
-          EOF
-
-          cat > Source/SoundFontSynth.h <<'EOF'
-          #pragma once
-          #include <JuceHeader.h>
-          #include <vector>
-          #include <mutex>
-          struct tsf;
-
-          class SoundFontSynth {
-          public:
-              SoundFontSynth();
-              ~SoundFontSynth();
-
-              void initialize(double sampleRate);
-              void noteOn(int channel, int note, float velocity);
-              void noteOff(int channel, int note);
-              void render(float* left, float* right, int samples);
-              void setInstrument(int channel, int program);
-
-          private:
-              tsf* synth = nullptr;
-              double rate = 44100.0;
-              std::mutex synthMutex;
-              std::vector<float> scratch;
-          };
-          EOF
-
-          cat > Source/SoundFontSynth.cpp <<'EOF'
-          #include "SoundFontSynth.h"
-          #define TSF_IMPLEMENTATION
-          #include "tsf.h"
-
-          SoundFontSynth::SoundFontSynth() {}
-
-          SoundFontSynth::~SoundFontSynth() {
-              std::lock_guard<std::mutex> guard(synthMutex);
-              if (synth) tsf_close(synth);
-              synth = nullptr;
-          }
-
-          void SoundFontSynth::initialize(double sampleRate) {
-              std::lock_guard<std::mutex> guard(synthMutex);
-              if (synth) tsf_close(synth);
-              synth = tsf_load_filename("SoundFont.sf2");
-              rate = sampleRate > 0 ? sampleRate : 44100.0;
-              if (synth) {
-                  tsf_set_output(synth, TSF_STEREO_INTERLEAVED, (int)rate, 0);
-                  tsf_channel_set_presetnumber(synth, 0, 0, 0);
-                  tsf_channel_set_presetnumber(synth, 1, 32, 0);
-                  tsf_channel_set_presetnumber(synth, 2, 48, 0);
-                  tsf_channel_set_presetnumber(synth, 3, 56, 0);
-              }
-          }
-
-          void SoundFontSynth::noteOn(int channel, int note, float velocity) {
-              std::lock_guard<std::mutex> guard(synthMutex);
-              if (synth) tsf_channel_note_on(synth, channel, note,
-                                              juce::jlimit(0.0f, 1.0f, velocity));
-          }
-
-          void SoundFontSynth::noteOff(int channel, int note) {
-              std::lock_guard<std::mutex> guard(synthMutex);
-              if (synth) tsf_channel_note_off(synth, channel, note);
-          }
-
-          void SoundFontSynth::setInstrument(int channel, int program) {
-              std::lock_guard<std::mutex> guard(synthMutex);
-              if (synth) tsf_channel_set_presetnumber(synth, channel, program, 0);
-          }
-
-          void SoundFontSynth::render(float* left, float* right, int samples) {
-              if (!left || samples <= 0) return;
-              std::lock_guard<std::mutex> guard(synthMutex);
-
-              if (!synth) {
-                  juce::FloatVectorOperations::clear(left, samples);
-                  if (right) juce::FloatVectorOperations::clear(right, samples);
-                  return;
-              }
-
-              scratch.resize((size_t)samples * 2);
-              tsf_render_float(synth, scratch.data(), samples, 0);
-
-              for (int i = 0; i < samples; ++i) {
-                  left[i] = scratch[(size_t)i * 2];
-                  if (right) right[i] = scratch[(size_t)i * 2 + 1];
-              }
-          }
-          EOF
-
-          cat > Source/Arranger.h <<'EOF'
-          #pragma once
-          #include <JuceHeader.h>
-          #include "SoundFontSynth.h"
-          #include <ixwebsocket/IXWebSocket.h>
-          #include <atomic>
-          #include <mutex>
-          #include <vector>
-
-          class Arranger : private juce::Timer {
-          public:
-              explicit Arranger(SoundFontSynth& synth);
-              ~Arranger();
-
-              void start();
-              void stop();
-              void sendStart();
-              void sendFeatures(int midi, float energy, float confidence,
-                                const juce::String& chord);
-              bool isConnected() const { return connected.load(); }
-
-          private:
-              struct Event {
-                  double at = 0;
-                  double off = 0;
-                  int note = 60;
-                  int velocity = 80;
-                  int channel = 0;
-              };
-
-              void timerCallback() override;
-              void receive(const std::string& data);
-              void schedule(const juce::var& payload);
-
-              SoundFontSynth& synth;
-              ix::WebSocket socket;
-              std::atomic<bool> connected {false};
-              std::atomic<bool> active {false};
-              std::mutex eventMutex;
-              std::vector<Event> events;
-              juce::uint64 epoch = 0;
-              double barLength = 2666.0;
-          };
-          EOF
-
-          cat > Source/Arranger.cpp <<'EOF'
-          #include "Arranger.h"
-          #include "Config.h"
-
-          Arranger::Arranger(SoundFontSynth& s) : synth(s) {}
-
-          Arranger::~Arranger() {
-              stop();
-          }
-
-          void Arranger::start() {
-              socket.setUrl(AI_LIVE_BAND_SERVER_URL);
-              socket.setPingInterval(20);
-              socket.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
-                  if (msg->type == ix::WebSocketMessageType::Open) {
-                      connected.store(true);
-                  } else if (msg->type == ix::WebSocketMessageType::Close ||
-                             msg->type == ix::WebSocketMessageType::Error) {
-                      connected.store(false);
-                  } else if (msg->type == ix::WebSocketMessageType::Message) {
-                      receive(msg->str);
-                  }
-              });
-              socket.start();
-              startTimerHz(100);
-          }
-
-          void Arranger::stop() {
-              active.store(false);
-              stopTimer();
-              socket.stop();
-              connected.store(false);
-              std::lock_guard<std::mutex> guard(eventMutex);
-              events.clear();
-          }
-
-          void Arranger::sendStart() {
-              if (!connected.load()) return;
-              juce::DynamicObject::Ptr object = new juce::DynamicObject();
-              object->setProperty("type", "start");
-              object->setProperty("style", "Gospel");
-              object->setProperty("key", "C");
-              object->setProperty("chord", "C");
-              object->setProperty("bpm", 90);
-              socket.send(juce::JSON::toString(juce::var(object.get())).toStdString());
-          }
-
-          void Arranger::sendFeatures(int midi, float energy, float confidence,
-                                      const juce::String& chord) {
-              if (!connected.load() || !active.load()) return;
-
-              juce::DynamicObject::Ptr object = new juce::DynamicObject();
-              object->setProperty("type", "vocal_features");
-              object->setProperty("style", "Gospel");
-              object->setProperty("key", "C");
-              object->setProperty("chord", chord);
-              object->setProperty("bpm", 90);
-              object->setProperty("pitch_hz", midi > 0
-                                  ? 440.0 * std::pow(2.0, (midi - 69) / 12.0)
-                                  : 0.0);
-              object->setProperty("confidence", confidence);
-              object->setProperty("energy", energy);
-              socket.send(juce::JSON::toString(juce::var(object.get())).toStdString());
-          }
-
-          void Arranger::receive(const std::string& data) {
-              auto parsed = juce::JSON::parse(juce::String(data));
-              if (!parsed.isObject()) return;
-
-              auto type = parsed.getProperty("type", "").toString();
-              if (type == "started") {
-                  active.store(true);
-              } else if (type == "stopped") {
-                  active.store(false);
-              } else if (type == "arrangement") {
-                  schedule(parsed);
-              }
-          }
-
-          void Arranger::schedule(const juce::var& payload) {
-              double bpm = (double)payload.getProperty("bpm", 90.0);
-              bpm = juce::jlimit(50.0, 180.0, bpm);
-              barLength = 240000.0 / bpm;
-              epoch = juce::Time::getMillisecondCounterHiRes();
-
-              auto list = payload.getProperty("events", juce::var());
-              if (!list.isArray()) return;
-
-              std::vector<Event> incoming;
-              for (const auto& item : *list.getArray()) {
-                  Event e;
-                  e.at = (double)item.getProperty("time_ms", 0);
-                  e.off = e.at + (double)item.getProperty("duration_ms", 250);
-                  e.note = (int)item.getProperty("note", 60);
-                  e.velocity = (int)item.getProperty("velocity", 80);
-
-                  auto instrument = item.getProperty("instrument", "keys").toString();
-                  if (instrument == "bass") e.channel = 1;
-                  else if (instrument == "lead") e.channel = 2;
-                  else e.channel = 0;
-
-                  incoming.push_back(e);
-              }
-
-              std::lock_guard<std::mutex> guard(eventMutex);
-              events.clear();
-              for (auto& e : incoming) {
-                  e.at += 100.0;
-                  e.off += 100.0;
-                  events.push_back(e);
-              }
-          }
-
-          void Arranger::timerCallback() {
-              if (!active.load()) return;
-
-              double now = juce::Time::getMillisecondCounterHiRes() - epoch;
-              std::vector<Event> dueOn;
-              std::vector<Event> dueOff;
-
-              {
-                  std::lock_guard<std::mutex> guard(eventMutex);
-                  for (auto it = events.begin(); it != events.end();) {
-                      if (it->at <= now) {
-                          dueOn.push_back(*it);
-                          it = events.erase(it);
-                      } else {
-                          ++it;
-                      }
-                  }
-
-                  for (auto it = events.begin(); it != events.end();) {
-                      if (it->off <= now) {
-                          dueOff.push_back(*it);
-                          it = events.erase(it);
-                      } else {
-                          ++it;
-                      }
-                  }
-              }
-
-              for (const auto& e : dueOn)
-                  synth.noteOn(e.channel, e.note, e.velocity / 127.0f);
-              for (const auto& e : dueOff)
-                  synth.noteOff(e.channel, e.note);
-          }
-          EOF
-
-          cat > Source/MainComponent.h <<'EOF'
-          #pragma once
-          #include <JuceHeader.h>
-          #include "PitchDetector.h"
-          #include "ChordInference.h"
-          #include "SoundFontSynth.h"
-          #include "Arranger.h"
-          #include <atomic>
-          #include <vector>
-
-          class MainComponent : public juce::Component,
-                                public juce::AudioIODeviceCallback,
-                                private juce::Timer {
-          public:
-              MainComponent();
-              ~MainComponent() override;
-              void paint(juce::Graphics&) override;
-              void resized() override;
-
-              void audioDeviceIOCallbackWithContext(
-                  const float* const*, int, float* const*, int, int,
-                  const juce::AudioIODeviceCallbackContext&) override;
-              void audioDeviceAboutToStart(juce::AudioIODevice*) override;
-              void audioDeviceStopped() override;
-
-          private:
-              void timerCallback() override;
-              void startPerformance();
-              void stopPerformance();
-
-              juce::AudioDeviceManager devices;
-              std::unique_ptr<PitchDetector> detector;
-              ChordInference chords;
-              SoundFontSynth synth;
-              std::unique_ptr<Arranger> arranger;
-
-              juce::Label status, note, chord;
-              juce::TextButton startButton {"Start Performance"};
-              juce::TextButton testButton {"Test Sound"};
-              juce::TextButton settingsButton {"Audio Settings"};
-
-              std::atomic<float> frequency {0};
-              std::atomic<float> confidence {0};
-              std::atomic<float> energy {0};
-              std::atomic<int> lastMidi {0};
-
-              std::vector<float> analysisBuffer;
-              int analysisPosition = 0;
-              JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
-          };
-          EOF
-
-          cat > Source/MainComponent.cpp <<'EOF'
-          #include "MainComponent.h"
-
-          MainComponent::MainComponent() {
-              setSize(700, 600);
-              addAndMakeVisible(status);
-              addAndMakeVisible(note);
-              addAndMakeVisible(chord);
-              addAndMakeVisible(startButton);
-              addAndMakeVisible(testButton);
-              addAndMakeVisible(settingsButton);
-
-              status.setText("AFRINODE AI LIVE BAND", juce::dontSendNotification);
-              status.setJustificationType(juce::Justification::centred);
-              status.setFont(juce::Font(juce::FontOptions(26.0f, juce::Font::bold)));
-
-              note.setJustificationType(juce::Justification::centred);
-              note.setFont(juce::Font(juce::FontOptions(48.0f)));
-              chord.setJustificationType(juce::Justification::centred);
-              chord.setFont(juce::Font(juce::FontOptions(32.0f)));
-
-              startButton.onClick = [this] {
-                  if (devices.getCurrentAudioDevice()) stopPerformance();
-                  else {
-                      if (!juce::RuntimePermissions::isGranted(
-                              juce::RuntimePermissions::recordAudio)) {
-                          juce::RuntimePermissions::request(
-                              juce::RuntimePermissions::recordAudio,
-                              [this](bool granted) {
-                                  if (granted) startPerformance();
-                                  else status.setText("Microphone permission denied",
-                                                      juce::dontSendNotification);
-                              });
-                      } else startPerformance();
-                  }
-              };
-
-              testButton.onClick = [this] {
-                  if (!devices.getCurrentAudioDevice()) return;
-                  synth.noteOn(0, 60, 0.8f);
-                  juce::Timer::callAfterDelay(500, [this] {
-                      synth.noteOff(0, 60);
-                  });
-              };
-
-              settingsButton.onClick = [this] {
-                  auto* selector = new juce::AudioDeviceSelectorComponent(
-                      devices, 1, 2, 1, 2, false, false, true, false);
-                  selector->setSize(500, 400);
-                  juce::DialogWindow::LaunchOptions options;
-                  options.content.setOwned(selector);
-                  options.dialogTitle = "Audio Settings";
-                  options.dialogBackgroundColour = juce::Colours::darkgrey;
-                  options.useNativeTitleBar = true;
-                  options.launchAsync();
-              };
-
-              startTimerHz(30);
-          }
-
-          MainComponent::~MainComponent() {
-              stopTimer();
-              stopPerformance();
-          }
-
-          void MainComponent::startPerformance() {
-              if (devices.getCurrentAudioDevice()) return;
-
-              auto error = devices.initialiseWithDefaultDevices(1, 2);
-              if (error.isNotEmpty()) {
-                  status.setText(error, juce::dontSendNotification);
-                  return;
-              }
-
-              arranger = std::make_unique<Arranger>(synth);
-              devices.addAudioCallback(this);
-              if (arranger) arranger->start();
-
-              startButton.setButtonText("Stop Performance");
-              status.setText("CONNECTING TO AFRINODE SERVER",
-                             juce::dontSendNotification);
-          }
-
-          void MainComponent::stopPerformance() {
-              if (devices.getCurrentAudioDevice()) {
-                  devices.removeAudioCallback(this);
-                  devices.closeAudioDevice();
-              }
-              if (arranger) {
-                  arranger->stop();
-                  arranger.reset();
-              }
-              startButton.setButtonText("Start Performance");
-              status.setText("STOPPED", juce::dontSendNotification);
-          }
-
-          void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* device) {
-              detector = std::make_unique<PitchDetector>(device->getCurrentSampleRate());
-              synth.initialize(device->getCurrentSampleRate());
-              analysisBuffer.assign(4096, 0.0f);
-              analysisPosition = 0;
-              if (arranger) arranger->sendStart();
-          }
-
-          void MainComponent::audioDeviceStopped() {
-              detector.reset();
-          }
-
-          void MainComponent::audioDeviceIOCallbackWithContext(
-              const float* const* inputs, int inputCount,
-              float* const* outputs, int outputCount, int samples,
-              const juce::AudioIODeviceCallbackContext&) {
-
-              if (inputCount > 0 && inputs && inputs[0] && detector) {
-                  double rms = 0.0;
-                  for (int i = 0; i < samples; ++i) {
-                      float x = inputs[0][i];
-                      rms += x * x;
-
-                      analysisBuffer[analysisPosition++] = x;
-                      if (analysisPosition >= (int)analysisBuffer.size()) {
-                          float conf = 0.0f;
-                          float freq = detector->detect(
-                              analysisBuffer.data(),
-                              (int)analysisBuffer.size(), conf);
-
-                          confidence.store(conf);
-                          frequency.store(freq);
-                          energy.store((float)std::sqrt(rms / juce::jmax(1, samples)));
-
-                          int midi = PitchDetector::freqToMidi(freq);
-                          if (freq > 0 && conf > 0.45f) {
-                              lastMidi.store(midi);
-                              chords.addNote(midi);
-                          }
-
-                          if (arranger)
-                              arranger->sendFeatures(midi, energy.load(),
-                                                     conf, chords.getChord());
-
-                          analysisPosition = 0;
-                          rms = 0.0;
-                      }
-                  }
-              }
-
-              if (outputCount > 0 && outputs && outputs[0]) {
-                  synth.render(outputs[0],
-                               outputCount > 1 ? outputs[1] : nullptr,
-                               samples);
-              }
-
-              for (int ch = 2; ch < outputCount; ++ch)
-                  if (outputs[ch])
-                      juce::FloatVectorOperations::clear(outputs[ch], samples);
-          }
-
-          void MainComponent::timerCallback() {
-              float f = frequency.load();
-              if (f > 0) note.setText(PitchDetector::freqToNote(f),
-                                      juce::dontSendNotification);
-              else note.setText("-", juce::dontSendNotification);
-
-              chord.setText(chords.getChord(), juce::dontSendNotification);
-
-              if (arranger && arranger->isConnected())
-                  status.setText("CONNECTED - LISTENING",
-                                 juce::dontSendNotification);
-              else if (devices.getCurrentAudioDevice())
-                  status.setText("WAITING FOR SERVER",
-                                 juce::dontSendNotification);
-          }
-
-          void MainComponent::paint(juce::Graphics& g) {
-              g.fillAll(juce::Colour::fromRGB(10, 12, 18));
-              g.setColour(juce::Colour::fromRGB(0, 220, 180));
-              g.drawRoundedRectangle(getLocalBounds().toFloat().reduced(8),
-                                     12.0f, 2.0f);
-          }
-
-          void MainComponent::resized() {
-              auto area = getLocalBounds().reduced(25);
-              status.setBounds(area.removeFromTop(70));
-              note.setBounds(area.removeFromTop(110));
-              chord.setBounds(area.removeFromTop(80));
-              area.removeFromTop(40);
-              startButton.setBounds(area.removeFromTop(60).reduced(10));
-              testButton.setBounds(area.removeFromTop(60).reduced(10));
-              settingsButton.setBounds(area.removeFromTop(60).reduced(10));
-          }
-          EOF
-
-          cat > Source/Main.cpp <<'EOF'
-          #include <JuceHeader.h>
-          #include "MainComponent.h"
-
-          class AILiveBandApplication : public juce::JUCEApplication {
-          public:
-              const juce::String getApplicationName() override { return "AI Live Band"; }
-              const juce::String getApplicationVersion() override { return "1.0.0"; }
-              bool moreThanOneInstanceAllowed() override { return true; }
-
-              void initialise(const juce::String&) override {
-                  window.reset(new MainWindow());
-              }
-
-              void shutdown() override { window.reset(); }
-              void systemRequestedQuit() override { quit(); }
-
-              class MainWindow : public juce::DocumentWindow {
-              public:
-                  MainWindow() : DocumentWindow(
-                      "AI Live Band", juce::Colours::black,
-                      #if JUCE_ANDROID
-                      0
-                      #else
-                      DocumentWindow::allButtons
-                      #endif
-                  ) {
-                      setContentOwned(new MainComponent(), true);
-                      #if JUCE_ANDROID
-                      setFullScreen(true);
-                      #else
-                      setUsingNativeTitleBar(true);
-                      setResizable(true, true);
-                      centreWithSize(700, 600);
-                      #endif
-                      setVisible(true);
-                  }
-
-                  void closeButtonPressed() override {
-                      JUCEApplication::getInstance()->systemRequestedQuit();
-                  }
-              };
-
-          private:
-              std::unique_ptr<MainWindow> window;
-          };
-
-          START_JUCE_APPLICATION(AILiveBandApplication)
-          EOF
-
-          cat > CMakeLists.txt <<'EOF'
+          set -euo pipefail
+          mkdir -p Source
+          mv tsf.h Source/tsf.h
+          mv SoundFont.sf2 Source/SoundFont.sf2
+
+          # ── CMakeLists.txt (DESKTOP) ──
+          cat > CMakeLists.txt << 'EOF'
           cmake_minimum_required(VERSION 3.22)
-          project(AILiveBand VERSION 1.0.0 LANGUAGES C CXX)
+          project(AILiveBand VERSION 0.4.0 LANGUAGES C CXX)
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
           set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
@@ -790,13 +117,15 @@ jobs:
           add_subdirectory(JUCE)
 
           include(FetchContent)
-          FetchContent_Declare(ixwebsocket
+          FetchContent_Declare(
+            ixwebsocket
             GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
-            GIT_TAG v11.4.4)
+            GIT_TAG        v11.4.4
+          )
           set(USE_TLS OFF CACHE BOOL "" FORCE)
           set(USE_ZLIB OFF CACHE BOOL "" FORCE)
           set(USE_TEST OFF CACHE BOOL "" FORCE)
-          set(USE_WS ON CACHE BOOL "" FORCE)
+          set(USE_WS OFF CACHE BOOL "" FORCE)
           set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
           FetchContent_MakeAvailable(ixwebsocket)
 
@@ -804,65 +133,78 @@ jobs:
 
           juce_add_gui_app(AILiveBand
             PRODUCT_NAME "AI Live Band"
-            COMPANY_NAME "AFRINODE"
-            VERSION "1.0.0"
+            COMPANY_NAME "AILiveBand"
+            VERSION "0.4.0"
             MICROPHONE_PERMISSION_ENABLED TRUE
-            MICROPHONE_PERMISSION_TEXT "AI Live Band needs microphone access.")
+            MICROPHONE_PERMISSION_TEXT "AI Live Band needs microphone access."
+          )
 
           juce_generate_juce_header(AILiveBand)
 
           target_sources(AILiveBand PRIVATE
-            Source/Main.cpp
-            Source/MainComponent.cpp
-            Source/PitchDetector.cpp
-            Source/ChordInference.cpp
-            Source/SoundFontSynth.cpp
-            Source/Arranger.cpp)
-
-          target_include_directories(AILiveBand PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/Source")
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/Main.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/MainComponent.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/PitchDetector.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/NoteTracker.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/Scheduler.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/ChordInference.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/KeyEstimator.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/TempoEstimator.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/Arranger.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/SoundFontSynth.cpp
+          )
 
           target_compile_definitions(AILiveBand PRIVATE
-            JUCE_WEB_BROWSER=0
-            JUCE_USE_CURL=0
+            JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
             JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:AILiveBand,JUCE_PRODUCT_NAME>"
-            JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:AILiveBand,JUCE_VERSION>")
-
-          target_link_libraries(AILiveBand PRIVATE
-            BinaryData
-            ixwebsocket
-            juce::juce_audio_utils
-            juce::juce_audio_devices
-            juce::juce_dsp
-            juce::juce_gui_extra
-            juce::juce_recommended_config_flags
-            juce::juce_recommended_warning_flags)
+            JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:AILiveBand,JUCE_VERSION>"
+          )
+          if(WIN32)
+            target_compile_definitions(AILiveBand PRIVATE NOMINMAX)
+          endif()
+          if(NOT MSVC)
+            target_compile_options(AILiveBand PRIVATE -Wno-zero-as-null-pointer-constant -Wno-unused-function)
+          endif()
+          target_link_libraries(AILiveBand
+            PRIVATE BinaryData
+              juce::juce_audio_utils juce::juce_audio_devices juce::juce_dsp
+              juce::juce_gui_extra juce::juce_events ixwebsocket
+            PUBLIC
+              juce::juce_recommended_config_flags juce::juce_recommended_warning_flags
+          )
           EOF
 
-          cat > AILiveBand.jucer <<'EOF'
+          # ── AILiveBand.jucer (ANDROID) ──
+          cat > AILiveBand.jucer << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
-          <JUCERPROJECT id="AILiveBand" name="AILiveBand"
-            projectType="guiapp" version="1.0.0"
-            companyName="AFRINODE" bundleIdentifier="com.afrinode.ailiveband">
+          <JUCERPROJECT id="AILiveBand" name="AILiveBand" projectType="guiapp" version="0.4.0" companyName="AILiveBand" bundleIdentifier="com.ailiveband">
             <MAINGROUP id="m" name="AI Live Band">
               <GROUP id="g" name="Source">
-                <FILE id="f1" name="Main.cpp" compile="1" resource="0" file="Source/Main.cpp"/>
-                <FILE id="f2" name="MainComponent.cpp" compile="1" resource="0" file="Source/MainComponent.cpp"/>
-                <FILE id="f3" name="MainComponent.h" compile="0" resource="0" file="Source/MainComponent.h"/>
-                <FILE id="f4" name="PitchDetector.cpp" compile="1" resource="0" file="Source/PitchDetector.cpp"/>
-                <FILE id="f5" name="PitchDetector.h" compile="0" resource="0" file="Source/PitchDetector.h"/>
-                <FILE id="f6" name="ChordInference.cpp" compile="1" resource="0" file="Source/ChordInference.cpp"/>
-                <FILE id="f7" name="ChordInference.h" compile="0" resource="0" file="Source/ChordInference.h"/>
-                <FILE id="f8" name="SoundFontSynth.cpp" compile="1" resource="0" file="Source/SoundFontSynth.cpp"/>
-                <FILE id="f9" name="SoundFontSynth.h" compile="0" resource="0" file="Source/SoundFontSynth.h"/>
-                <FILE id="f10" name="Arranger.cpp" compile="1" resource="0" file="Source/Arranger.cpp"/>
-                <FILE id="f11" name="Arranger.h" compile="0" resource="0" file="Source/Arranger.h"/>
-                <FILE id="f12" name="ChordInference.cpp" compile="1" resource="0" file="Source/ChordInference.cpp"/>
-                <FILE id="f13" name="Config.h" compile="0" resource="0" file="Source/Config.h"/>
-                <FILE id="f14" name="tsf.h" compile="0" resource="0" file="Source/tsf.h"/>
+                <FILE id="f1"  name="Main.cpp" compile="1" resource="0" file="Source/Main.cpp"/>
+                <FILE id="f2"  name="MainComponent.cpp" compile="1" resource="0" file="Source/MainComponent.cpp"/>
+                <FILE id="f3"  name="MainComponent.h" compile="0" resource="0" file="Source/MainComponent.h"/>
+                <FILE id="f4"  name="PitchDetector.cpp" compile="1" resource="0" file="Source/PitchDetector.cpp"/>
+                <FILE id="f5"  name="PitchDetector.h" compile="0" resource="0" file="Source/PitchDetector.h"/>
+                <FILE id="f15" name="NoteTracker.cpp" compile="1" resource="0" file="Source/NoteTracker.cpp"/>
+                <FILE id="f16" name="NoteTracker.h" compile="0" resource="0" file="Source/NoteTracker.h"/>
+                <FILE id="f17" name="Scheduler.cpp" compile="1" resource="0" file="Source/Scheduler.cpp"/>
+                <FILE id="f18" name="Scheduler.h" compile="0" resource="0" file="Source/Scheduler.h"/>
+                <FILE id="f6"  name="ChordInference.cpp" compile="1" resource="0" file="Source/ChordInference.cpp"/>
+                <FILE id="f7"  name="ChordInference.h" compile="0" resource="0" file="Source/ChordInference.h"/>
+                <FILE id="f19" name="KeyEstimator.cpp" compile="1" resource="0" file="Source/KeyEstimator.cpp"/>
+                <FILE id="f20" name="KeyEstimator.h" compile="0" resource="0" file="Source/KeyEstimator.h"/>
+                <FILE id="f21" name="TempoEstimator.cpp" compile="1" resource="0" file="Source/TempoEstimator.cpp"/>
+                <FILE id="f22" name="TempoEstimator.h" compile="0" resource="0" file="Source/TempoEstimator.h"/>
+                <FILE id="f8"  name="Arranger.cpp" compile="1" resource="0" file="Source/Arranger.cpp"/>
+                <FILE id="f9"  name="Arranger.h" compile="0" resource="0" file="Source/Arranger.h"/>
+                <FILE id="f10" name="SoundFontSynth.cpp" compile="1" resource="0" file="Source/SoundFontSynth.cpp"/>
+                <FILE id="f11" name="SoundFontSynth.h" compile="0" resource="0" file="Source/SoundFontSynth.h"/>
+                <FILE id="f12" name="tsf.h" compile="0" resource="0" file="Source/tsf.h"/>
+                <FILE id="f14" name="GMNames.h" compile="0" resource="0" file="Source/GMNames.h"/>
+                <FILE id="f23" name="Config.h" compile="0" resource="0" file="Source/Config.h"/>
               </GROUP>
-              <GROUP id="g2" name="Resources">
-                <FILE id="f15" name="SoundFont.sf2" compile="0" resource="1" file="Source/SoundFont.sf2"/>
+              <GROUP id="g2" name="BinaryData">
+                <FILE id="f13" name="SoundFont.sf2" compile="0" resource="1" file="Source/SoundFont.sf2"/>
               </GROUP>
             </MAINGROUP>
             <MODULES>
@@ -881,245 +223,2046 @@ jobs:
             </MODULES>
             <JUCEOPTIONS JUCE_WEB_BROWSER="0" JUCE_USE_CURL="0"/>
             <EXPORTFORMATS>
-              <ANDROIDSTUDIO targetFolder="Builds/Android"
-                minSdkVersion="24" androidMicNeeded="1"
-                androidInternetNeeded="1"/>
+              <ANDROIDSTUDIO targetFolder="Builds/Android" minSdkVersion="24" androidMicNeeded="1" androidInternetNeeded="1">
+                <CONFIGURATIONS>
+                  <CONFIGURATION name="Debug" isDebug="1" extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH"/>
+                  <CONFIGURATION name="Release" isDebug="0" optimise="1" extraCompilerFlags="-IIXWEBSOCKET_INCLUDE_PATH"/>
+                </CONFIGURATIONS>
+              </ANDROIDSTUDIO>
             </EXPORTFORMATS>
           </JUCERPROJECT>
           EOF
 
-      - name: Upload source package
-        uses: actions/upload-artifact@v4
+          # ── GMNames.h ──
+          cat > Source/GMNames.h << 'EOF'
+          #pragma once
+          static const char* const GM_NAMES[128] = {
+            "Acoustic Grand","Bright Piano","Elec Grand","Honky-Tonk","Elec Piano 1","Elec Piano 2","Harpsichord","Clavinet",
+            "Celesta","Glockenspiel","Music Box","Vibraphone","Marimba","Xylophone","Tubular Bells","Dulcimer",
+            "Drawbar Organ","Percussive Organ","Rock Organ","Church Organ","Reed Organ","Accordion","Harmonica","Tango Accordion",
+            "Nylon Guitar","Steel Guitar","Jazz Guitar","Clean Guitar","Muted Guitar","Overdrive Guitar","Distortion Guitar","Guitar Harmonics",
+            "Acoustic Bass","Finger Bass","Pick Bass","Fretless Bass","Slap Bass 1","Slap Bass 2","Synth Bass 1","Synth Bass 2",
+            "Violin","Viola","Cello","Contrabass","Tremolo Strings","Pizzicato Strings","Orchestral Harp","Timpani",
+            "String Ensemble 1","String Ensemble 2","Syn Strings 1","Syn Strings 2","Choir Aahs","Voice Oohs","Syn Voice","Orch Hit",
+            "Trumpet","Trombone","Tuba","Muted Trumpet","French Horn","Brass Section","Syn Brass 1","Syn Brass 2",
+            "Soprano Sax","Alto Sax","Tenor Sax","Baritone Sax","Oboe","English Horn","Bassoon","Clarinet",
+            "Piccolo","Flute","Recorder","Pan Flute","Blown Bottle","Shakuhachi","Whistle","Ocarina",
+            "Square Lead","Saw Lead","Calliope Lead","Chiff Lead","Charang","Voice Lead","Fifths","Bass+Lead",
+            "New Age Pad","Warm Pad","Polysynth Pad","Choir Pad","Bowed Pad","Metallic Pad","Halo Pad","Sweep Pad",
+            "Rain","Soundtrack","Crystal","Atmosphere","Brightness","Goblins","Echoes","Sci-Fi",
+            "Sitar","Banjo","Shamisen","Koto","Kalimba","Bagpipe","Fiddle","Shanai",
+            "Tinkle Bell","Agogo","Steel Drums","Woodblock","Taiko Drum","Melodic Tom","Syn Drum","Reverse Cymbal",
+            "Guitar Fret","Breath","Seashore","Bird Tweet","Telephone","Helicopter","Applause","Gunshot"
+          };
+          static const char* const GM_KEYS[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+          EOF
+
+          # ── PitchDetector (worker thread YIN with RMS gate) ──
+          cat > Source/PitchDetector.h << 'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          #include <array>
+          #include <atomic>
+
+          class PitchDetector : private juce::Thread {
+          public:
+              struct Frame {
+                  float frequency = 0.0f, confidence = 0.0f, rms = 0.0f;
+                  int   midi = -1;
+                  bool  voiced = false;
+              };
+              PitchDetector();
+              ~PitchDetector() override;
+              void prepare(double sampleRate);
+              void feed(const float* samples, int numSamples);
+              Frame latestFrame() const;
+              static juce::String freqToNote(float freq);
+              static int   freqToMidi(float freq);
+              static float midiToFreq(int midi);
+          private:
+              void run() override;
+              static constexpr int kRingSize = 8192;
+              static constexpr int kWindow   = 2048;
+              static constexpr int kHop      = 512;
+              static constexpr float kVoicedMicRmsThreshold = 0.015f;
+
+              std::array<float, kRingSize> ring{};
+              std::atomic<int> writePos { 0 };
+              std::atomic<int> lastAnalyzed { 0 };
+              double sr = 44100.0;
+
+              std::atomic<float> outFreq { 0.0f };
+              std::atomic<float> outConf { 0.0f };
+              std::atomic<float> outRms  { 0.0f };
+              std::atomic<int>   outMidi { -1 };
+              std::atomic<bool>  outVoiced { false };
+
+              std::array<float, kWindow> buf{};
+              std::array<float, kWindow / 2> yin{};
+              std::array<float, kWindow / 2> cmnd{};
+              std::array<float, 8> pitchHist{};
+              int  pitchHistCount = 0;
+              std::array<int, 8> midiHist{};
+              int  midiHistCount = 0;
+              int  lastMidiLocal = -1;
+          };
+          EOF
+
+          cat > Source/PitchDetector.cpp << 'EOF'
+          #include "PitchDetector.h"
+          #include <algorithm>
+          #include <cmath>
+
+          PitchDetector::PitchDetector() : juce::Thread("PitchWorker") {}
+          PitchDetector::~PitchDetector() { signalThreadShouldExit(); notify(); stopThread(2000); }
+
+          void PitchDetector::prepare(double sampleRate) {
+              sr = sampleRate;
+              writePos.store(0); lastAnalyzed.store(0);
+              pitchHistCount = 0; midiHistCount = 0; lastMidiLocal = -1;
+              outFreq.store(0.0f); outConf.store(0.0f); outRms.store(0.0f);
+              outMidi.store(-1); outVoiced.store(false);
+              if (!isThreadRunning()) startThread(juce::Thread::Priority::low);
+          }
+          void PitchDetector::feed(const float* s, int n) {
+              if (!s || n <= 0) return;
+              int wp = writePos.load(std::memory_order_relaxed);
+              for (int i = 0; i < n; ++i) ring[(wp + i) % kRingSize] = s[i];
+              writePos.store(wp + n, std::memory_order_release);
+          }
+          PitchDetector::Frame PitchDetector::latestFrame() const {
+              Frame f;
+              f.frequency  = outFreq.load(std::memory_order_acquire);
+              f.confidence = outConf.load(std::memory_order_acquire);
+              f.rms        = outRms.load(std::memory_order_acquire);
+              f.midi       = outMidi.load(std::memory_order_acquire);
+              f.voiced     = outVoiced.load(std::memory_order_acquire);
+              return f;
+          }
+          void PitchDetector::run() {
+              while (!threadShouldExit()) {
+                  wait(5);
+                  int wp = writePos.load(std::memory_order_acquire);
+                  if (wp - lastAnalyzed.load(std::memory_order_relaxed) < kHop) continue;
+                  if (wp < kWindow) { lastAnalyzed.store(wp, std::memory_order_relaxed); continue; }
+                  lastAnalyzed.store(wp, std::memory_order_relaxed);
+                  int start = wp - kWindow;
+                  for (int i = 0; i < kWindow; ++i) buf[i] = ring[(start + i) % kRingSize];
+
+                  double sqSum = 0.0;
+                  for (int i = 0; i < kWindow; ++i) sqSum += (double)buf[i] * (double)buf[i];
+                  float rms = (float)std::sqrt(sqSum / (double)kWindow);
+                  outRms.store(rms, std::memory_order_release);
+
+                  const int half = kWindow / 2;
+                  for (int tau = 1; tau < half; ++tau) {
+                      double s = 0.0;
+                      for (int j = 0; j < half; ++j) { double d = buf[j] - buf[j + tau]; s += d * d; }
+                      yin[tau] = (float)s;
+                  }
+                  yin[0] = 0.0f; cmnd[0] = 1.0f;
+                  double running = 0.0;
+                  for (int tau = 1; tau < half; ++tau) {
+                      running += yin[tau];
+                      cmnd[tau] = running > 1e-9 ? (float)(yin[tau] * tau / running) : 1.0f;
+                  }
+                  int tauEst = -1;
+                  for (int tau = 2; tau < half - 1; ++tau) {
+                      if (cmnd[tau] < 0.15f) {
+                          while (tau + 1 < half && cmnd[tau + 1] < cmnd[tau]) ++tau;
+                          tauEst = tau; break;
+                      }
+                  }
+                  if (tauEst < 0 || rms <= kVoicedMicRmsThreshold) { outVoiced.store(false, std::memory_order_release); continue; }
+                  float betterTau = (float)tauEst;
+                  if (tauEst > 0 && tauEst < half - 1) {
+                      float s0 = cmnd[tauEst - 1], s1 = cmnd[tauEst], s2 = cmnd[tauEst + 1];
+                      float denom = 2.0f * (2.0f * s1 - s2 - s0);
+                      if (std::abs(denom) > 1e-6f) betterTau = tauEst + (s2 - s0) / denom;
+                  }
+                  float freq = (float)(sr / betterTau);
+                  float conf = juce::jlimit(0.0f, 1.0f, 1.0f - cmnd[tauEst]);
+                  int midi = (int)std::round(69.0 + 12.0 * std::log2(freq / 440.0));
+                  if (midi < 21 || midi > 108) { outVoiced.store(false, std::memory_order_release); continue; }
+                  if (lastMidiLocal > 0 && std::abs(midi - lastMidiLocal) == 12) {
+                      int stable = 0;
+                      for (int k = 0; k < midiHistCount; ++k) if (midiHist[k] == midi) ++stable;
+                      if (stable < 2) { midi = lastMidiLocal; freq = midiToFreq(midi); }
+                  }
+                  if (pitchHistCount < 8) pitchHist[pitchHistCount++] = freq;
+                  else { std::rotate(pitchHist.begin(), pitchHist.begin()+1, pitchHist.end()); pitchHist[7] = freq; }
+                  if (midiHistCount < 8) midiHist[midiHistCount++] = midi;
+                  else { std::rotate(midiHist.begin(), midiHist.begin()+1, midiHist.end()); midiHist[7] = midi; }
+                  if (pitchHistCount >= 3) {
+                      std::array<float, 8> s = pitchHist;
+                      std::sort(s.begin(), s.begin() + pitchHistCount);
+                      float med = s[pitchHistCount / 2];
+                      if (std::abs(std::log2(med / freq)) > 0.4f) {
+                          freq = med;
+                          midi = (int)std::round(69.0 + 12.0 * std::log2(freq / 440.0));
+                      }
+                  }
+                  bool voiced = conf > 0.5f && freq > 60.0f && freq < 2000.0f && rms > kVoicedMicRmsThreshold;
+                  if (voiced) lastMidiLocal = midi;
+                  outFreq.store(freq, std::memory_order_release);
+                  outConf.store(conf, std::memory_order_release);
+                  outMidi.store(midi, std::memory_order_release);
+                  outVoiced.store(voiced, std::memory_order_release);
+              }
+          }
+          juce::String PitchDetector::freqToNote(float freq) {
+              if (freq <= 0.0f) return "-";
+              static const char* N[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+              int m = freqToMidi(freq);
+              return juce::String(N[((m % 12) + 12) % 12]) + juce::String(m / 12 - 1);
+          }
+          int PitchDetector::freqToMidi(float freq) {
+              if (freq <= 0.0f) return 0;
+              return (int)std::round(69.0 + 12.0 * std::log2(freq / 440.0));
+          }
+          float PitchDetector::midiToFreq(int midi) { return 440.0f * std::pow(2.0f, (midi - 69) / 12.0f); }
+          EOF
+
+          # ── NoteTracker (60 ms hold + ±1 semitone flicker filter + audio-time onset) ──
+          cat > Source/NoteTracker.h << 'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          #include "PitchDetector.h"
+          #include <atomic>
+          #include <vector>
+
+          struct NoteEventRecord {
+              double bar = 0, beat = 0;
+              int midi = 0;
+              float velocity = 0.8f;
+              double durationBeats = 0.5;
+              float confidence = 0.0f;
+              double onsetTimeSec = 0.0;
+          };
+
+          class NoteTracker {
+          public:
+              void setBeatsPerBar(int b) { beatsPerBar = b; }
+              void resetAudioClock() { audioTimeSec = 0.0; }
+              void processBlockFrames(const PitchDetector::Frame& f, double beat, int bar,
+                                      int numSamples, double sampleRate);
+              std::vector<NoteEventRecord> drainEvents();
+              bool drainPhraseEnd();
+              bool  isSinging()  const { return singing.load(std::memory_order_relaxed); }
+              float getLoudness() const { return loudness.load(std::memory_order_relaxed); }
+              float getLoudnessTrend() const { return loudnessTrend.load(std::memory_order_relaxed); }
+          private:
+              void pushEvent(const NoteEventRecord& e);
+              void finishCurrentNote(double beat);
+              int beatsPerBar = 4;
+              std::atomic<bool>  singing { false };
+              std::atomic<float> loudness { 0.0f };
+              std::atomic<float> loudnessTrend { 0.0f };
+              float lastLoudness = 0.0f;
+              double audioTimeSec = 0.0;
+
+              static constexpr int kMaxQueued = 64;
+              NoteEventRecord queue[kMaxQueued];
+              juce::AbstractFifo fifo { kMaxQueued };
+              std::atomic<bool> phraseEndPending { false };
+
+              bool   inNote = false, inSilence = true, phraseEndFired = false, everSang = false;
+              int    currentMidi = -1;
+              int    pendingMidi = -1;
+              double pendingMidiStartTimeSec = 0.0;
+              double noteStartBeat = 0.0, noteStartBar = 0.0;
+              double noteStartAudioTimeSec = 0.0;
+              float  currentVelocity = 0.8f, currentConfidence = 0.0f;
+              double silenceStartBeat = 0.0;
+              static constexpr double kPhraseGapBeats = 1.0;
+              static constexpr double kMinNoteBeats   = 0.08;
+              static constexpr double kNoteHoldSeconds = 0.060;
+              static constexpr int    kMaxFlickerSemitones = 1;
+          };
+          EOF
+
+          cat > Source/NoteTracker.cpp << 'EOF'
+          #include "NoteTracker.h"
+          #include <cmath>
+
+          void NoteTracker::pushEvent(const NoteEventRecord& e) {
+              int s1, n1, s2, n2;
+              fifo.prepareToWrite(1, s1, n1, s2, n2);
+              if (n1 > 0) { queue[s1] = e; fifo.finishedWrite(1); }
+              else if (n2 > 0) { queue[s2] = e; fifo.finishedWrite(1); }
+          }
+
+          void NoteTracker::finishCurrentNote(double beat) {
+              if (!inNote) return;
+              double dur = beat - noteStartBeat;
+              if (dur >= kMinNoteBeats) {
+                  NoteEventRecord e;
+                  e.bar = noteStartBar;
+                  e.beat = std::fmod(noteStartBeat, (double)beatsPerBar);
+                  e.midi = currentMidi;
+                  e.velocity = currentVelocity;
+                  e.durationBeats = dur;
+                  e.confidence = currentConfidence;
+                  e.onsetTimeSec = noteStartAudioTimeSec;
+                  pushEvent(e);
+              }
+              inNote = false;
+              currentMidi = -1;
+              pendingMidi = -1;
+          }
+
+          void NoteTracker::processBlockFrames(const PitchDetector::Frame& f, double beat, int bar,
+                                               int numSamples, double sampleRate) {
+              loudness.store(f.rms, std::memory_order_relaxed);
+              loudnessTrend.store(f.rms - lastLoudness, std::memory_order_relaxed);
+              lastLoudness = f.rms;
+              const bool voiced = f.voiced && f.midi >= 21 && f.midi <= 108;
+              singing.store(voiced, std::memory_order_relaxed);
+              if (voiced) everSang = true;
+
+              if (voiced) {
+                  phraseEndFired = false;
+                  if (!inNote) {
+                      if (pendingMidi != f.midi) {
+                          pendingMidi = f.midi;
+                          pendingMidiStartTimeSec = audioTimeSec;
+                      }
+                      if ((audioTimeSec - pendingMidiStartTimeSec) >= kNoteHoldSeconds) {
+                          inNote = true;
+                          currentMidi = f.midi;
+                          noteStartBeat = beat;
+                          noteStartBar = bar;
+                          noteStartAudioTimeSec = audioTimeSec;
+                          currentVelocity = juce::jlimit(0.1f, 1.0f, f.rms * 3.0f);
+                          currentConfidence = f.confidence;
+                          pendingMidi = -1;
+                      }
+                  } else {
+                      int diff = std::abs(f.midi - currentMidi);
+                      if (diff <= kMaxFlickerSemitones) {
+                          pendingMidi = -1;
+                      } else {
+                          if (pendingMidi != f.midi) {
+                              pendingMidi = f.midi;
+                              pendingMidiStartTimeSec = audioTimeSec;
+                          }
+                          if ((audioTimeSec - pendingMidiStartTimeSec) >= kNoteHoldSeconds) {
+                              finishCurrentNote(beat);
+                              inNote = true;
+                              currentMidi = f.midi;
+                              noteStartBeat = beat;
+                              noteStartBar = bar;
+                              noteStartAudioTimeSec = audioTimeSec;
+                              currentVelocity = juce::jlimit(0.1f, 1.0f, f.rms * 3.0f);
+                              currentConfidence = f.confidence;
+                              pendingMidi = -1;
+                          }
+                      }
+                  }
+                  inSilence = false;
+              } else {
+                  finishCurrentNote(beat);
+                  if (!inSilence) { inSilence = true; silenceStartBeat = beat; }
+                  else if (everSang && !phraseEndFired && (beat - silenceStartBeat) >= kPhraseGapBeats) {
+                      phraseEndPending.store(true, std::memory_order_relaxed);
+                      phraseEndFired = true;
+                  }
+              }
+              audioTimeSec += (double)numSamples / juce::jmax(1.0, sampleRate);
+          }
+
+          std::vector<NoteEventRecord> NoteTracker::drainEvents() {
+              std::vector<NoteEventRecord> out;
+              int ready = fifo.getNumReady();
+              if (ready <= 0) return out;
+              out.reserve(ready);
+              int s1, n1, s2, n2;
+              fifo.prepareToRead(ready, s1, n1, s2, n2);
+              for (int i = 0; i < n1; ++i) out.push_back(queue[s1 + i]);
+              for (int i = 0; i < n2; ++i) out.push_back(queue[s2 + i]);
+              fifo.finishedRead(n1 + n2);
+              return out;
+          }
+          bool NoteTracker::drainPhraseEnd() {
+              return phraseEndPending.exchange(false, std::memory_order_relaxed);
+          }
+          EOF
+
+          # ── KeyEstimator (major + minor Krumhansl) ──
+          cat > Source/KeyEstimator.h << 'EOF'
+          #pragma once
+          class KeyEstimator {
+          public:
+              struct Result { int tonic; bool isMinor; float confidence; };
+              void addNoteDuration(int midi, double durationBeats);
+              Result estimate() const;
+          private:
+              float weights[12] = {0};
+              float total = 0.0f;
+          };
+          EOF
+
+          cat > Source/KeyEstimator.cpp << 'EOF'
+          #include "KeyEstimator.h"
+          #include <JuceHeader.h>
+          #include <algorithm>
+          #include <cmath>
+
+          void KeyEstimator::addNoteDuration(int midi, double durationBeats) {
+              for (auto& w : weights) w *= 0.995f;
+              float d = (float)juce::jlimit(0.05, 4.0, durationBeats);
+              weights[((midi % 12) + 12) % 12] += d;
+              total = 0.0f;
+              for (auto w : weights) total += w;
+              if (total > 200.0f) {
+                  float k = 200.0f / total;
+                  for (auto& w : weights) w *= k;
+                  total = 200.0f;
+              }
+          }
+
+          KeyEstimator::Result KeyEstimator::estimate() const {
+              static const float MAJ[12] = {6.35f,2.23f,3.48f,2.33f,4.38f,4.09f,2.52f,5.19f,2.39f,3.66f,2.29f,2.88f};
+              static const float MIN[12] = {6.33f,2.68f,3.52f,5.38f,2.60f,3.53f,2.54f,4.75f,3.98f,2.69f,3.34f,3.17f};
+              auto corr = [&](const float* profile, int tonic) {
+                  float mP = 0.0f; for (int i = 0; i < 12; ++i) mP += profile[i]; mP /= 12.0f;
+                  float mW = total / 12.0f;
+                  float num = 0, dw2 = 0, dp2 = 0;
+                  for (int i = 0; i < 12; ++i) {
+                      float dw = weights[(tonic + i) % 12] - mW;
+                      float dp = profile[i] - mP;
+                      num += dw * dp; dw2 += dw * dw; dp2 += dp * dp;
+                  }
+                  float den = std::sqrt(dw2 * dp2);
+                  return den > 1e-6f ? num / den : 0.0f;
+              };
+              float best = -2.0f;
+              int   bestTonic = 0; bool bestMinor = false;
+              for (int T = 0; T < 12; ++T) {
+                  float cM = corr(MAJ, T);
+                  if (cM > best) { best = cM; bestTonic = T; bestMinor = false; }
+                  float cm = corr(MIN, T);
+                  if (cm > best) { best = cm; bestTonic = T; bestMinor = true; }
+              }
+              return { bestTonic, bestMinor, juce::jlimit(0.0f, 1.0f, best) };
+          }
+          EOF
+
+          # ── TempoEstimator (from real onset times) ──
+          cat > Source/TempoEstimator.h << 'EOF'
+          #pragma once
+          #include <array>
+          class TempoEstimator {
+          public:
+              struct Result { double bpm; float confidence; };
+              void addOnset(double timeSec);
+              Result estimate() const;
+          private:
+              static constexpr int kMax = 16;
+              std::array<double, kMax> iois{};
+              int count = 0, idx = 0;
+              double lastOnset = -1.0;
+          };
+          EOF
+
+          cat > Source/TempoEstimator.cpp << 'EOF'
+          #include "TempoEstimator.h"
+          #include <JuceHeader.h>
+          #include <algorithm>
+
+          void TempoEstimator::addOnset(double t) {
+              if (lastOnset > 0) {
+                  double ioi = t - lastOnset;
+                  if (ioi > 0.1 && ioi < 2.0) {
+                      iois[idx] = ioi; idx = (idx + 1) % kMax;
+                      if (count < kMax) ++count;
+                  }
+              }
+              lastOnset = t;
+          }
+          TempoEstimator::Result TempoEstimator::estimate() const {
+              if (count < 3) return {120.0, 0.0f};
+              std::array<double, kMax> s = iois;
+              std::sort(s.begin(), s.begin() + count);
+              double median = s[count / 2];
+              double q1 = s[count / 4];
+              double q3 = s[(3 * count) / 4];
+              double iqr = q3 - q1;
+              double bpm = 60.0 / median;
+              if (bpm < 40.0 || bpm > 240.0) return {120.0, 0.0f};
+              float conf = (float)juce::jlimit(0.0, 1.0, 1.0 - iqr / juce::jmax(0.02, median));
+              return { bpm, conf };
+          }
+          EOF
+
+          # ── ChordInference (UI thread only) ──
+          cat > Source/ChordInference.h << 'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          #include <vector>
+          class ChordInference {
+          public:
+              void addNote(int midi);
+              juce::String getChord() const;
+              int getRootNote() const;
+              std::vector<int> getChordNotes() const;
+              void clear();
+          private:
+              std::vector<int> recent;
+          };
+          EOF
+          cat > Source/ChordInference.cpp << 'EOF'
+          #include "ChordInference.h"
+          namespace {
+              const char* ROOTS[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+              struct T { const char* name; std::vector<int> iv; };
+              const std::vector<T> TEMPLATES = {
+                  {"maj",{0,4,7}},{"min",{0,3,7}},{"dim",{0,3,6}},{"aug",{0,4,8}},
+                  {"sus4",{0,5,7}},{"maj7",{0,4,7,11}},{"min7",{0,3,7,10}}
+              };
+              int parseRoot(const juce::String& chord, juce::String& quality) {
+                  quality = juce::String();
+                  if (chord.isEmpty()) return -1;
+                  int len = (chord.length() > 1 && chord[1] == '#') ? 2 : 1;
+                  juce::String name = chord.substring(0, len);
+                  quality = chord.substring(len);
+                  for (int i = 0; i < 12; ++i) if (name == ROOTS[i]) return i;
+                  return -1;
+              }
+          }
+          void ChordInference::addNote(int m) {
+              if (m <= 0) return;
+              recent.push_back(m);
+              if (recent.size() > 12) recent.erase(recent.begin());
+          }
+          void ChordInference::clear() { recent.clear(); }
+          juce::String ChordInference::getChord() const {
+              if (recent.empty()) return "-";
+              int counts[12] = {0};
+              for (int n : recent) counts[((n % 12) + 12) % 12]++;
+              int bestRoot = -1, bestScore = -1000000; juce::String bestName;
+              for (int root = 0; root < 12; ++root) {
+                  for (auto& t : TEMPLATES) {
+                      int score = 0, outside = 0; bool in[12] = {false};
+                      for (int iv : t.iv) in[(root + iv) % 12] = true;
+                      for (int pc = 0; pc < 12; ++pc) { if (in[pc]) score += counts[pc]; else outside += counts[pc]; }
+                      score -= outside / 2;
+                      if (score > bestScore) { bestScore = score; bestRoot = root; bestName = juce::String(ROOTS[root]) + t.name; }
+                  }
+              }
+              return bestRoot < 0 ? juce::String("-") : bestName;
+          }
+          int ChordInference::getRootNote() const {
+              juce::String c = getChord(); if (c == "-") return 48;
+              juce::String q; int r = parseRoot(c, q); return r < 0 ? 48 : 48 + r;
+          }
+          std::vector<int> ChordInference::getChordNotes() const {
+              std::vector<int> notes;
+              juce::String c = getChord(); if (c == "-") return notes;
+              juce::String q; int r = parseRoot(c, q); if (r < 0) return notes;
+              int root = 60 + r; notes.push_back(root);
+              if (q.contains("maj")) { notes.push_back(root+4); notes.push_back(root+7); if (q.contains("7")) notes.push_back(root+11); }
+              else if (q.contains("min")) { notes.push_back(root+3); notes.push_back(root+7); if (q.contains("7")) notes.push_back(root+10); }
+              else if (q.contains("dim")) { notes.push_back(root+3); notes.push_back(root+6); }
+              else if (q.contains("aug")) { notes.push_back(root+4); notes.push_back(root+8); }
+              else if (q.contains("sus4")) { notes.push_back(root+5); notes.push_back(root+7); }
+              return notes;
+          }
+          EOF
+
+          # ── SoundFontSynth (polyphony limit, pan conversion) ──
+          cat > Source/SoundFontSynth.h << 'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          struct tsf;
+          class SoundFontSynth {
+          public:
+              SoundFontSynth();
+              ~SoundFontSynth();
+              void initialize(double sampleRate);
+              void noteOn (int channel, int midiNote, float velocity);
+              void noteOff(int channel, int midiNote);
+              void allNotesOff();
+              void setInstrument    (int channel, int programNumber);
+              void setChannelVolume (int channel, float volume);
+              void setChannelPan    (int channel, float panMinus1ToPlus1);
+              void render(float* left, float* right, int numSamples);
+              void prepareLimiterForBlock(int maxBlock);
+          private:
+              void enforcePolyphony();
+              tsf* synth = nullptr;
+              juce::HeapBlock<float> scratch;
+              int scratchSize = 0;
+              juce::Reverb reverb;
+              juce::dsp::Limiter<float> limiter;
+              juce::AudioBuffer<float> limBuf;
+              double sr = 44100.0;
+              int maxBlock = 512;
+              struct ActiveNote { int ch; int midi; };
+              static constexpr int kMaxPoly = 32;
+              ActiveNote active[kMaxPoly];
+              int numActive = 0;
+          };
+          EOF
+          cat > Source/SoundFontSynth.cpp << 'EOF'
+          #include "SoundFontSynth.h"
+          #define TSF_IMPLEMENTATION
+          #include "tsf.h"
+
+          SoundFontSynth::SoundFontSynth() {}
+          SoundFontSynth::~SoundFontSynth() { if (synth) tsf_close(synth); }
+
+          void SoundFontSynth::prepareLimiterForBlock(int maxBlockSamples) {
+              maxBlock = juce::jmax(maxBlockSamples, 512);
+              limiter.prepare({ sr, (juce::uint32)maxBlock, 2 });
+              limBuf.setSize(2, maxBlock, false, false, true);
+              if (scratchSize < maxBlock * 2) { scratch.allocate((size_t)(maxBlock * 2), false); scratchSize = maxBlock * 2; }
+          }
+
+          void SoundFontSynth::initialize(double sampleRate) {
+              sr = sampleRate;
+              if (synth) { tsf_close(synth); synth = nullptr; }
+              if (BinaryData::SoundFont_sf2Size == 0) return;
+              synth = tsf_load_memory(BinaryData::SoundFont_sf2, BinaryData::SoundFont_sf2Size);
+              if (!synth) return;
+              tsf_set_output(synth, TSF_STEREO_INTERLEAVED, (int)sr, 0);
+              for (int ch = 0; ch < 16; ++ch)
+                  tsf_channel_set_presetnumber(synth, ch, 0, ch == 9 ? 1 : 0);
+              for (int ch = 0; ch < 16; ++ch)
+                  tsf_channel_set_pan(synth, ch, 0.5f);
+              reverb.setSampleRate(sr);
+              juce::Reverb::Parameters p;
+              p.roomSize = 0.5f; p.damping = 0.6f; p.wetLevel = 0.18f;
+              p.dryLevel = 0.82f; p.width = 0.8f; p.freezeMode = 0.0f;
+              reverb.setParameters(p);
+              prepareLimiterForBlock(juce::jmax(4096, maxBlock));
+              numActive = 0;
+          }
+
+          void SoundFontSynth::enforcePolyphony() {
+              while (numActive > kMaxPoly) {
+                  int victim = 0;
+                  if (synth) tsf_channel_note_off(synth, active[victim].ch, active[victim].midi);
+                  for (int i = victim; i < numActive - 1; ++i) active[i] = active[i + 1];
+                  --numActive;
+              }
+          }
+
+          void SoundFontSynth::noteOn(int ch, int m, float v) {
+              if (!synth) return;
+              bool found = false;
+              for (int i = 0; i < numActive; ++i)
+                  if (active[i].ch == ch && active[i].midi == m) { found = true; break; }
+              if (!found && numActive >= kMaxPoly) enforcePolyphony();
+              tsf_channel_note_on(synth, ch, m, v);
+              if (!found && numActive < kMaxPoly) active[numActive++] = { ch, m };
+          }
+          void SoundFontSynth::noteOff(int ch, int m) {
+              if (!synth) return;
+              tsf_channel_note_off(synth, ch, m);
+              for (int i = 0; i < numActive; ) {
+                  if (active[i].ch == ch && active[i].midi == m) { active[i] = active[--numActive]; }
+                  else ++i;
+              }
+          }
+          void SoundFontSynth::allNotesOff() {
+              if (synth) tsf_note_off_all(synth);
+              numActive = 0;
+          }
+          void SoundFontSynth::setInstrument(int ch, int p) { if (synth) tsf_channel_set_presetnumber(synth, ch, p, ch == 9 ? 1 : 0); }
+          void SoundFontSynth::setChannelVolume(int ch, float v) { if (synth) tsf_channel_set_volume(synth, ch, juce::jlimit(0.0f, 1.0f, v)); }
+          void SoundFontSynth::setChannelPan(int ch, float pan) {
+              if (!synth) return;
+              float sfPan = juce::jlimit(0.0f, 1.0f, (pan + 1.0f) * 0.5f);
+              tsf_channel_set_pan(synth, ch, sfPan);
+          }
+          void SoundFontSynth::render(float* left, float* right, int n) {
+              if (!synth) { juce::FloatVectorOperations::clear(left, n); if (right) juce::FloatVectorOperations::clear(right, n); return; }
+              if (scratchSize < n * 2) { scratch.allocate((size_t)(n * 2), false); scratchSize = n * 2; }
+              if (limBuf.getNumSamples() < n) limBuf.setSize(2, n, false, false, true);
+              tsf_render_float(synth, scratch.get(), n, 0);
+              for (int i = 0; i < n; ++i) { left[i] = scratch[i * 2]; if (right) right[i] = scratch[i * 2 + 1]; }
+              if (right) reverb.processStereo(left, right, n);
+              juce::FloatVectorOperations::copy(limBuf.getWritePointer(0), left, n);
+              if (right) juce::FloatVectorOperations::copy(limBuf.getWritePointer(1), right, n);
+              juce::dsp::AudioBlock<float> blk(limBuf.getArrayOfWritePointers(), 2, (size_t)n);
+              juce::dsp::ProcessContextReplacing<float> ctx(blk);
+              limiter.process(ctx);
+              juce::FloatVectorOperations::copy(left, limBuf.getReadPointer(0), n);
+              if (right) juce::FloatVectorOperations::copy(right, limBuf.getReadPointer(1), n);
+          }
+          EOF
+
+          # ── Scheduler (consolidated pending-plan helper, bar-boundary apply, clean Start reset) ──
+          cat > Source/Scheduler.h << 'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          #include <array>
+          #include <atomic>
+
+          class SoundFontSynth;
+
+          struct ScheduledEvent {
+              double beat = 0.0;
+              int    channel = 0;
+              int    midi = 60;
+              float  velocity = 0.8f;
+              double duration = 0.5;
+          };
+
+          static constexpr int kMaxEventsPerBar = 64;
+          struct ChannelMix {
+              bool  present = false;
+              int   preset = -1;
+              float volume = 0.8f;
+              float pan = 0.0f;
+              bool  mute = false;
+              float fade = 0.0f;
+          };
+          struct RawPlan {
+              int   bar = -1;
+              double tempo = 120.0;
+              int   numEvents = 0;
+              ScheduledEvent events[kMaxEventsPerBar];
+              ChannelMix mixer[16];
+          };
+
+          struct InstrumentSnapshot {
+              struct Ch { int preset = -1; bool present = false; } ch[16];
+          };
+
+          class Scheduler {
+          public:
+              Scheduler();
+              void setSampleRate(double sr)  { sampleRate = sr; }
+              void setTempo(double bpm)      { tempo.store(bpm); }
+              double getTempo() const        { return tempo.load(); }
+              double getBeatsPerBar() const  { return beatsPerBar; }
+              bool   isRunning() const       { return running.load(); }
+              bool   isCountingIn() const    { return countInRemaining > 0.0; }
+              int    getCurrentBar() const   { return currentBar.load(); }
+              double getBeatPosition() const { return beatPosition.load(); }
+
+              void start();
+              void stop();
+              void queuePlan(const RawPlan& plan);
+              void queueSliderChange(int channel, float value);
+              InstrumentSnapshot getInstrumentSnapshot() const;
+              void processBlock(int numSamples, SoundFontSynth& synth);
+
+              struct SliderMsg { int channel; float value; };
+
+          private:
+              void seedDefaultGroove();
+              void applyPlanAtBar(const RawPlan& plan, SoundFontSynth& synth);
+              void applyPendingPlansUpToBar(int bar, SoundFontSynth& synth);
+              void drainPlanRing();
+              void drainSliderFifo();
+              void advanceFades(double beatsThisBlock);
+              void loadBarEventsFor(int bar, SoundFontSynth& synth);
+              void applyVolumeForChannel(int ch, SoundFontSynth& synth);
+              void clearBarSlots();
+              void resetSnapshot();
+
+              static constexpr int kPlanRingSize = 8;
+              static constexpr int kMaxBarSlots  = 16;
+              static constexpr int kMaxOffs      = 64;
+              static constexpr int kMaxSliderMsgs = 64;
+              static constexpr int kClickMidi = 76;
+
+              double sampleRate = 44100.0;
+              double beatsPerBar = 4.0;
+              std::atomic<bool>   running { false };
+              std::atomic<double> tempo { 120.0 };
+              std::atomic<double> beatPosition { 0.0 };
+              std::atomic<int>    currentBar { 0 };
+
+              double countInRemaining = 0.0;
+              int    lastCountInIdx = -1;
+              double countInBeatsElapsed = 0.0;
+
+              struct BarSlot { int bar = -1; int count = 0; ScheduledEvent events[kMaxEventsPerBar]; };
+              BarSlot barSlots[kMaxBarSlots];
+
+              RawPlan pendingPlans[kMaxBarSlots];
+              int numPending = 0;
+
+              ScheduledEvent activeEvents[kMaxEventsPerBar];
+              int numActiveEvents = 0;
+              int eventCursor = 0;
+
+              ScheduledEvent lastGoodEvents[kMaxEventsPerBar];
+              int lastGoodEventCount = 0;
+              int lastGoodBar = -1;
+
+              ScheduledEvent defaultGroove[kMaxEventsPerBar];
+              int defaultGrooveCount = 0;
+
+              struct PendingOff { double beat; int ch; int midi; };
+              PendingOff offs[kMaxOffs];
+              int numOffs = 0;
+
+              RawPlan planRing[kPlanRingSize];
+              std::atomic<int> planRingWrite { 0 };
+              std::atomic<int> planRingRead { 0 };
+
+              SliderMsg sliderMsgs[kMaxSliderMsgs];
+              juce::AbstractFifo sliderFifo { kMaxSliderMsgs };
+
+              float userVolume[16];
+              float serverVolumeCur[16];
+              float serverVolumeTgt[16];
+              float serverVolumeStep[16];
+              float fadeRemainingBeats[16];
+
+              InstrumentSnapshot instSnap[2];
+              std::atomic<int> instSnapIdx { 0 };
+          };
+          EOF
+
+          cat > Source/Scheduler.cpp << 'EOF'
+          #include "Scheduler.h"
+          #include "SoundFontSynth.h"
+          #include <algorithm>
+          #include <climits>
+
+          Scheduler::Scheduler() {
+              for (int i = 0; i < 16; ++i) {
+                  userVolume[i] = 1.0f;
+                  serverVolumeCur[i] = (i == 9 ? 0.9f : 0.8f);
+                  serverVolumeTgt[i] = serverVolumeCur[i];
+                  serverVolumeStep[i] = 0.0f;
+                  fadeRemainingBeats[i] = 0.0f;
+              }
+              resetSnapshot();
+              clearBarSlots();
+              seedDefaultGroove();
+          }
+
+          void Scheduler::resetSnapshot() {
+              InstrumentSnapshot empty{};
+              instSnap[0] = empty;
+              instSnap[1] = empty;
+              instSnapIdx.store(0, std::memory_order_release);
+          }
+
+          void Scheduler::clearBarSlots() {
+              for (auto& s : barSlots) { s.bar = -1; s.count = 0; }
+              numPending = 0;
+              lastGoodEventCount = 0;
+              lastGoodBar = -1;
+          }
+
+          void Scheduler::seedDefaultGroove() {
+              defaultGrooveCount = 0;
+              auto push = [&](double beat, int ch, int note, float vel, double dur) {
+                  if (defaultGrooveCount >= kMaxEventsPerBar) return;
+                  defaultGroove[defaultGrooveCount++] = { beat, ch, note, vel, dur };
+              };
+              push(0.0, 9, 36, 0.9f, 0.1);
+              push(2.0, 9, 36, 0.9f, 0.1);
+              push(1.0, 9, 38, 0.8f, 0.1);
+              push(3.0, 9, 38, 0.8f, 0.1);
+              for (int i = 0; i < 8; ++i) push(i * 0.5, 9, 42, 0.4f, 0.05);
+              for (int b = 0; b < 4; ++b) {
+                  push((double)b, 2, 48, 0.5f, 0.9);
+                  push((double)b, 2, 52, 0.5f, 0.9);
+                  push((double)b, 2, 55, 0.5f, 0.9);
+              }
+              push(0.0, 1, 36, 0.7f, 0.4);
+              push(2.0, 1, 36, 0.7f, 0.4);
+              std::sort(defaultGroove, defaultGroove + defaultGrooveCount,
+                  [](const ScheduledEvent& a, const ScheduledEvent& b) { return a.beat < b.beat; });
+          }
+
+          void Scheduler::start() {
+              beatPosition.store(0.0);
+              currentBar.store(0);
+              countInRemaining = beatsPerBar;
+              countInBeatsElapsed = 0.0;
+              lastCountInIdx = -1;
+              numOffs = 0;
+              eventCursor = 0;
+              numActiveEvents = 0;
+              planRingRead.store(planRingWrite.load(std::memory_order_acquire), std::memory_order_release);
+              sliderFifo.reset();
+              resetSnapshot();
+              clearBarSlots();
+              for (int i = 0; i < 16; ++i) {
+                  userVolume[i] = 1.0f;
+                  serverVolumeCur[i] = (i == 9 ? 0.9f : 0.8f);
+                  serverVolumeTgt[i] = serverVolumeCur[i];
+                  serverVolumeStep[i] = 0.0f;
+                  fadeRemainingBeats[i] = 0.0f;
+              }
+              running.store(true);
+          }
+          void Scheduler::stop() { running.store(false); }
+
+          void Scheduler::queuePlan(const RawPlan& plan) {
+              int w = planRingWrite.load(std::memory_order_relaxed);
+              int r = planRingRead.load(std::memory_order_acquire);
+              if (w - r >= kPlanRingSize - 1) return;
+              planRing[w % kPlanRingSize] = plan;
+              planRingWrite.store(w + 1, std::memory_order_release);
+          }
+          void Scheduler::queueSliderChange(int ch, float v) {
+              if (ch < 0 || ch >= 16) return;
+              int s1, n1, s2, n2;
+              sliderFifo.prepareToWrite(1, s1, n1, s2, n2);
+              if (n1 > 0) { sliderMsgs[s1] = { ch, v }; sliderFifo.finishedWrite(1); }
+              else if (n2 > 0) { sliderMsgs[s2] = { ch, v }; sliderFifo.finishedWrite(1); }
+          }
+
+          InstrumentSnapshot Scheduler::getInstrumentSnapshot() const {
+              int idx = instSnapIdx.load(std::memory_order_acquire);
+              return instSnap[idx];
+          }
+
+          void Scheduler::drainPlanRing() {
+              int w = planRingWrite.load(std::memory_order_acquire);
+              int r = planRingRead.load(std::memory_order_relaxed);
+              int curBar = currentBar.load(std::memory_order_acquire);
+              while (r < w) {
+                  const RawPlan& p = planRing[r % kPlanRingSize];
+                  if (p.bar > curBar && numPending < kMaxBarSlots) {
+                      int existing = -1;
+                      for (int i = 0; i < numPending; ++i) {
+                          if (pendingPlans[i].bar == p.bar) { existing = i; break; }
+                      }
+                      if (existing >= 0) pendingPlans[existing] = p;
+                      else pendingPlans[numPending++] = p;
+                  }
+                  ++r;
+              }
+              planRingRead.store(r, std::memory_order_release);
+          }
+
+          void Scheduler::drainSliderFifo() {
+              int ready = sliderFifo.getNumReady();
+              if (ready <= 0) return;
+              int s1, n1, s2, n2;
+              sliderFifo.prepareToRead(ready, s1, n1, s2, n2);
+              for (int i = 0; i < n1; ++i) {
+                  const auto& m = sliderMsgs[s1 + i];
+                  if (m.channel >= 0 && m.channel < 16) userVolume[m.channel] = m.value;
+              }
+              for (int i = 0; i < n2; ++i) {
+                  const auto& m = sliderMsgs[s2 + i];
+                  if (m.channel >= 0 && m.channel < 16) userVolume[m.channel] = m.value;
+              }
+              sliderFifo.finishedRead(n1 + n2);
+          }
+
+          void Scheduler::applyVolumeForChannel(int ch, SoundFontSynth& synth) {
+              synth.setChannelVolume(ch, serverVolumeCur[ch] * userVolume[ch]);
+          }
+
+          void Scheduler::advanceFades(double beatsThisBlock) {
+              for (int ch = 0; ch < 16; ++ch) {
+                  if (fadeRemainingBeats[ch] > 0.0f) {
+                      serverVolumeCur[ch] += serverVolumeStep[ch] * (float)beatsThisBlock;
+                      fadeRemainingBeats[ch] -= (float)beatsThisBlock;
+                      if (fadeRemainingBeats[ch] <= 0.0f) {
+                          serverVolumeCur[ch] = serverVolumeTgt[ch];
+                          fadeRemainingBeats[ch] = 0.0f;
+                      }
+                  }
+              }
+          }
+
+          void Scheduler::applyPlanAtBar(const RawPlan& plan, SoundFontSynth& synth) {
+              int slotIdx = -1, emptyIdx = -1;
+              for (int i = 0; i < kMaxBarSlots; ++i) {
+                  if (barSlots[i].bar == plan.bar) { slotIdx = i; break; }
+                  if (barSlots[i].bar == -1 && emptyIdx < 0) emptyIdx = i;
+              }
+              if (slotIdx < 0) slotIdx = emptyIdx;
+              if (slotIdx < 0) {
+                  int lowest = INT_MAX;
+                  for (int i = 0; i < kMaxBarSlots; ++i)
+                      if (barSlots[i].bar < lowest) { lowest = barSlots[i].bar; slotIdx = i; }
+              }
+              barSlots[slotIdx].bar = plan.bar;
+              barSlots[slotIdx].count = juce::jmin(plan.numEvents, kMaxEventsPerBar);
+              for (int i = 0; i < barSlots[slotIdx].count; ++i)
+                  barSlots[slotIdx].events[i] = plan.events[i];
+              std::sort(barSlots[slotIdx].events, barSlots[slotIdx].events + barSlots[slotIdx].count,
+                  [](const ScheduledEvent& a, const ScheduledEvent& b) { return a.beat < b.beat; });
+
+              int next = 1 - instSnapIdx.load(std::memory_order_relaxed);
+              instSnap[next] = instSnap[1 - next];
+              for (int ch = 0; ch < 16; ++ch) {
+                  const auto& m = plan.mixer[ch];
+                  if (!m.present) continue;
+                  if (m.preset >= 0) {
+                      synth.setInstrument(ch, m.preset);
+                      instSnap[next].ch[ch].preset = m.preset;
+                      instSnap[next].ch[ch].present = true;
+                  }
+                  synth.setChannelPan(ch, m.pan);
+                  float target = m.mute ? 0.0f : m.volume;
+                  if (m.fade > 0.01f) {
+                      serverVolumeTgt[ch] = target;
+                      serverVolumeStep[ch] = (target - serverVolumeCur[ch]) / m.fade;
+                      fadeRemainingBeats[ch] = m.fade;
+                  } else {
+                      serverVolumeCur[ch] = target;
+                      serverVolumeTgt[ch] = target;
+                      fadeRemainingBeats[ch] = 0.0f;
+                      applyVolumeForChannel(ch, synth);
+                  }
+              }
+              instSnapIdx.store(next, std::memory_order_release);
+              if (plan.tempo > 1.0) tempo.store(plan.tempo);
+          }
+
+          void Scheduler::applyPendingPlansUpToBar(int bar, SoundFontSynth& synth) {
+              for (int i = 0; i < numPending; ) {
+                  if (pendingPlans[i].bar <= bar) {
+                      RawPlan local = pendingPlans[i];
+                      pendingPlans[i] = pendingPlans[--numPending];
+                      applyPlanAtBar(local, synth);
+                  } else {
+                      ++i;
+                  }
+              }
+          }
+
+          void Scheduler::loadBarEventsFor(int bar, SoundFontSynth& synth) {
+              applyPendingPlansUpToBar(bar, synth);
+              int slotIdx = -1;
+              for (int i = 0; i < kMaxBarSlots; ++i)
+                  if (barSlots[i].bar == bar) { slotIdx = i; break; }
+              if (slotIdx >= 0) {
+                  numActiveEvents = barSlots[slotIdx].count;
+                  for (int i = 0; i < numActiveEvents; ++i) activeEvents[i] = barSlots[slotIdx].events[i];
+                  lastGoodEventCount = numActiveEvents;
+                  for (int i = 0; i < numActiveEvents; ++i) lastGoodEvents[i] = activeEvents[i];
+                  lastGoodBar = bar;
+              } else if (lastGoodEventCount > 0) {
+                  numActiveEvents = lastGoodEventCount;
+                  for (int i = 0; i < numActiveEvents; ++i) activeEvents[i] = lastGoodEvents[i];
+              } else {
+                  numActiveEvents = defaultGrooveCount;
+                  for (int i = 0; i < numActiveEvents; ++i) activeEvents[i] = defaultGroove[i];
+              }
+              eventCursor = 0;
+          }
+
+          void Scheduler::processBlock(int numSamples, SoundFontSynth& synth) {
+              if (!running.load()) return;
+              drainPlanRing();
+              drainSliderFifo();
+              const double bpm = tempo.load();
+              const double beatsPerSample = bpm / 60.0 / sampleRate;
+              const double beatsThisBlock = beatsPerSample * numSamples;
+              advanceFades(beatsThisBlock);
+              for (int ch = 0; ch < 16; ++ch) applyVolumeForChannel(ch, synth);
+
+              for (int s = 0; s < numSamples; ++s) {
+                  if (countInRemaining > 0.0) {
+                      countInRemaining -= beatsPerSample;
+                      countInBeatsElapsed += beatsPerSample;
+                      int curIdx = (int)(beatsPerBar - countInRemaining + 1e-9);
+                      if (curIdx > lastCountInIdx && curIdx < (int)beatsPerBar) {
+                          lastCountInIdx = curIdx;
+                          synth.noteOn(9, kClickMidi, 1.0f);
+                          if (numOffs < kMaxOffs) offs[numOffs++] = { countInBeatsElapsed + 0.1, 9, kClickMidi };
+                      }
+                      for (int i = 0; i < numOffs; ) {
+                          if (offs[i].beat <= countInBeatsElapsed) { synth.noteOff(offs[i].ch, offs[i].midi); offs[i] = offs[--numOffs]; }
+                          else ++i;
+                      }
+                      if (countInRemaining <= 0.0) {
+                          countInRemaining = 0.0;
+                          beatPosition.store(0.0);
+                          currentBar.store(0);
+                          numOffs = 0;
+                          loadBarEventsFor(0, synth);
+                      }
+                      continue;
+                  }
+
+                  double curBeat = beatPosition.load();
+                  double nextBeat = curBeat + beatsPerSample;
+
+                  for (int i = 0; i < numOffs; ) {
+                      if (offs[i].beat <= nextBeat) { synth.noteOff(offs[i].ch, offs[i].midi); offs[i] = offs[--numOffs]; }
+                      else ++i;
+                  }
+
+                  int newBar = (int)(nextBeat / beatsPerBar);
+                  if (newBar != currentBar.load()) {
+                      currentBar.store(newBar);
+                      loadBarEventsFor(newBar, synth);
+                  }
+
+                  while (eventCursor < numActiveEvents) {
+                      const auto& e = activeEvents[eventCursor];
+                      double triggerBeat = currentBar.load() * beatsPerBar + e.beat;
+                      if (triggerBeat > nextBeat) break;
+                      if (triggerBeat >= curBeat) {
+                          synth.noteOn(e.channel, e.midi, e.velocity);
+                          if (numOffs < kMaxOffs) offs[numOffs++] = { triggerBeat + e.duration, e.channel, e.midi };
+                      }
+                      ++eventCursor;
+                  }
+                  beatPosition.store(nextBeat);
+              }
+          }
+          EOF
+
+          # ── Arranger ──
+          cat > Source/Arranger.h << 'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          #include "Scheduler.h"
+          #include <atomic>
+          #include <memory>
+          #include <vector>
+
+          namespace ix { class WebSocket; }
+
+          struct PlanPayload {
+              int bar = 0;
+              double tempo = 120.0;
+              juce::String section, chord;
+              struct Event { double bar, beat; int channel, midi; float velocity; double duration; };
+              std::vector<Event> events;
+              std::array<ChannelMix, 16> mixer {};
+          };
+
+          class Arranger {
+          public:
+              Arranger();
+              ~Arranger();
+              void start();
+              void stop();
+              void sendStateJson(const juce::String& json);
+              std::vector<std::shared_ptr<PlanPayload>> drainPlans();
+              bool  isConnected() const { return connected.load(); }
+              float getRttMs()    const { return rttMs.load(); }
+          private:
+              void handleMessage(const std::string& text);
+              std::unique_ptr<ix::WebSocket> webSocket;
+              std::atomic<bool>  connected { false };
+              std::atomic<float> rttMs     { 0.0f };
+              juce::CriticalSection plansLock;
+              std::vector<std::shared_ptr<PlanPayload>> pendingPlans;
+          };
+          EOF
+
+          cat > Source/Arranger.cpp << 'EOF'
+          #include <ixwebsocket/IXNetSystem.h>
+          #include <ixwebsocket/IXWebSocket.h>
+          #include "Arranger.h"
+          #include "Config.h"
+
+          Arranger::Arranger() { ix::initNetSystem(); webSocket = std::make_unique<ix::WebSocket>(); }
+          Arranger::~Arranger() { stop(); webSocket.reset(); ix::uninitNetSystem(); }
+
+          void Arranger::start() {
+              juce::String url = juce::String(AI_LIVE_BAND_SERVER_URL) + "/?token=" + juce::String(AI_LIVE_BAND_ACCESS_TOKEN);
+              webSocket->setUrl(url.toStdString());
+              webSocket->setPingInterval(30);
+              webSocket->enableAutomaticReconnection();
+              webSocket->setMinWaitBetweenReconnectionRetries(1000);
+              webSocket->setMaxWaitBetweenReconnectionRetries(5000);
+              webSocket->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
+                  if (msg->type == ix::WebSocketMessageType::Open) connected.store(true);
+                  else if (msg->type == ix::WebSocketMessageType::Close) connected.store(false);
+                  else if (msg->type == ix::WebSocketMessageType::Message) handleMessage(msg->str);
+                  else if (msg->type == ix::WebSocketMessageType::Error) connected.store(false);
+              });
+              webSocket->start();
+          }
+          void Arranger::stop() { if (webSocket) webSocket->stop(); connected.store(false); }
+          void Arranger::sendStateJson(const juce::String& j) {
+              if (!webSocket || !connected.load()) return;
+              webSocket->send(j.toStdString());
+          }
+          std::vector<std::shared_ptr<PlanPayload>> Arranger::drainPlans() {
+              const juce::ScopedLock sl(plansLock);
+              auto out = std::move(pendingPlans);
+              pendingPlans.clear();
+              return out;
+          }
+          void Arranger::handleMessage(const std::string& text) {
+              try {
+                  auto v = juce::JSON::parse(juce::String(text));
+                  auto* o = v.getDynamicObject(); if (!o) return;
+                  auto type = o->getProperty("type").toString();
+                  if (type == "plan") {
+                      auto plan = std::make_shared<PlanPayload>();
+                      plan->bar = (int)o->getProperty("bar");
+                      plan->tempo = (double)o->getProperty("tempo");
+                      plan->section = o->getProperty("section").toString();
+                      plan->chord = o->getProperty("chord").toString();
+                      if (auto* ev = o->getProperty("events").getArray()) {
+                          for (auto& e : *ev) {
+                              auto* eo = e.getDynamicObject(); if (!eo) continue;
+                              plan->events.push_back({
+                                  (double)eo->getProperty("bar"), (double)eo->getProperty("beat"),
+                                  (int)eo->getProperty("channel"), (int)eo->getProperty("note"),
+                                  (float)(double)eo->getProperty("velocity"), (double)eo->getProperty("duration")
+                              });
+                          }
+                      }
+                      if (auto* mo = o->getProperty("mixer").getDynamicObject()) {
+                          for (auto& p : mo->getProperties()) {
+                              int ch = p.name.toString().getIntValue();
+                              if (ch < 0 || ch >= 16) continue;
+                              auto* co = p.value.getDynamicObject(); if (!co) continue;
+                              auto& m = plan->mixer[ch];
+                              m.present = true;
+                              m.preset = (int)co->getProperty("preset");
+                              m.volume = (float)(double)co->getProperty("volume");
+                              m.pan    = (float)(double)co->getProperty("pan");
+                              m.mute   = (bool)co->getProperty("mute");
+                              m.fade   = (float)(double)co->getProperty("fade");
+                          }
+                      }
+                      const juce::ScopedLock sl(plansLock);
+                      pendingPlans.push_back(std::move(plan));
+                  } else if (type == "pong") {
+                      double t0 = (double)o->getProperty("ts");
+                      if (t0 > 0) rttMs.store((float)(juce::Time::getMillisecondCounterHiRes() - t0));
+                  }
+              } catch (...) {}
+          }
+          EOF
+
+          # ── MainComponent (juce::StringArray, input guard, Start reset, mixer slider clear) ──
+          cat > Source/MainComponent.h << 'EOF'
+          #pragma once
+          #include <JuceHeader.h>
+          #include "PitchDetector.h"
+          #include "NoteTracker.h"
+          #include "Scheduler.h"
+          #include "ChordInference.h"
+          #include "KeyEstimator.h"
+          #include "TempoEstimator.h"
+          #include "Arranger.h"
+          #include "SoundFontSynth.h"
+          #include <atomic>
+
+          class MainComponent : public juce::Component, public juce::AudioIODeviceCallback, private juce::Timer {
+          public:
+              MainComponent();
+              ~MainComponent() override;
+              void paint(juce::Graphics&) override;
+              void resized() override;
+              void audioDeviceIOCallbackWithContext(const float* const*, int, float* const*, int, int,
+                  const juce::AudioIODeviceCallbackContext&) override;
+              void audioDeviceAboutToStart(juce::AudioIODevice*) override;
+              void audioDeviceStopped() override;
+          private:
+              void timerCallback() override;
+              void startAudio();
+              void stopAudio();
+              void showAudioSettings();
+              void sendState(bool phraseEnd);
+              void resetMixerSliders();
+              void rebuildMixerFromSnapshot(const InstrumentSnapshot& snap);
+
+              juce::AudioDeviceManager deviceManager;
+              std::unique_ptr<PitchDetector> pitchDetector;
+              NoteTracker   noteTracker;
+              Scheduler     scheduler;
+              ChordInference chordInference;
+              KeyEstimator   keyEstimator;
+              TempoEstimator tempoEstimator;
+              SoundFontSynth synth;
+              std::unique_ptr<Arranger> arranger;
+
+              juce::Label  noteLabel, chordLabel, stateLabel, keyLabel, tempoLabel,
+                           instrumentsLabel, headphoneLabel, rttLabel, bleedLabel;
+              juce::TextButton startButton { "Start" }, settingsButton { "Audio" };
+              juce::ToggleButton headphonesToggle { "Headphones" };
+              juce::Slider tempoSlider;
+              juce::OwnedArray<juce::Slider> channelSliders;
+              juce::OwnedArray<juce::Label>  channelLabels;
+              int channelIds[16];
+
+              std::atomic<float> currentFreq { 0.0f };
+              std::atomic<float> currentConfidence { 0.0f };
+              std::atomic<float> currentEnergy { 0.0f };
+              std::atomic<float> lastBandRms { 0.0f };
+              std::atomic<float> bleedCorrelation { 0.0f };
+              std::atomic<bool>  headphonesOn { false };
+              std::atomic<double> currentSampleRate { 44100.0 };
+              std::atomic<float> userTempoBpm { 120.0f };
+              std::atomic<float> userTempoConf { 0.0f };
+              std::atomic<int>   userKeyPc { 0 };
+              std::atomic<int>   userKeyMinor { 0 };
+              std::atomic<float> userKeyConf { 0.0f };
+
+              std::vector<NoteEventRecord> pendingNotesForSend;
+              double lastSendMs = 0.0;
+              int64_t nextPingMs = 0;
+          };
+          EOF
+
+          cat > Source/MainComponent.cpp << 'EOF'
+          #include "MainComponent.h"
+          #include "GMNames.h"
+          #include <cmath>
+
+          static void styleLabel(juce::Label& l, float size, juce::Colour c) {
+              l.setFont(juce::Font(juce::FontOptions(size)));
+              l.setColour(juce::Label::textColourId, c);
+              l.setJustificationType(juce::Justification::centred);
+          }
+
+          MainComponent::MainComponent() {
+              for (int i = 0; i < 16; ++i) channelIds[i] = -1;
+
+              styleLabel(stateLabel, 20.0f, juce::Colours::cyan);
+              styleLabel(noteLabel,  42.0f, juce::Colours::white);
+              styleLabel(chordLabel, 28.0f, juce::Colour::fromRGB(0,255,200));
+              styleLabel(keyLabel,   18.0f, juce::Colour::fromRGB(180,220,255));
+              styleLabel(tempoLabel, 18.0f, juce::Colour::fromRGB(180,220,255));
+              styleLabel(instrumentsLabel, 13.0f, juce::Colour::fromRGB(200,200,200));
+              styleLabel(headphoneLabel,   13.0f, juce::Colours::orange);
+              styleLabel(rttLabel,    13.0f, juce::Colours::grey);
+              styleLabel(bleedLabel,  13.0f, juce::Colours::orange);
+              headphoneLabel.setText("Headphones recommended", juce::dontSendNotification);
+              rttLabel.setText("RTT: --", juce::dontSendNotification);
+              keyLabel.setText("Key: - (0%)", juce::dontSendNotification);
+              tempoLabel.setText("120 BPM", juce::dontSendNotification);
+              instrumentsLabel.setText("Instruments: -", juce::dontSendNotification);
+              for (auto* l : { &stateLabel, &noteLabel, &chordLabel, &keyLabel, &tempoLabel,
+                               &instrumentsLabel, &headphoneLabel, &rttLabel, &bleedLabel })
+                  addAndMakeVisible(l);
+
+              startButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(0,100,80));
+              settingsButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(40,40,40));
+              addAndMakeVisible(startButton);
+              addAndMakeVisible(settingsButton);
+              headphonesToggle.setColour(juce::ToggleButton::textColourId, juce::Colours::white);
+              headphonesToggle.onClick = [this] { headphonesOn.store(headphonesToggle.getToggleState()); };
+              addAndMakeVisible(headphonesToggle);
+
+              tempoSlider.setRange(60.0, 200.0, 1.0);
+              tempoSlider.setValue(120.0);
+              tempoSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 22);
+              tempoSlider.onValueChange = [this] { scheduler.setTempo(tempoSlider.getValue()); };
+              addAndMakeVisible(tempoSlider);
+
+              startButton.onClick = [this] {
+                  if (!deviceManager.getCurrentAudioDevice()) {
+                      if (!juce::RuntimePermissions::isGranted(juce::RuntimePermissions::recordAudio)) {
+                          juce::RuntimePermissions::request(juce::RuntimePermissions::recordAudio,
+                              [this](bool granted) {
+                                  if (granted) startAudio();
+                                  else stateLabel.setText("MIC DENIED", juce::dontSendNotification);
+                              });
+                      } else startAudio();
+                  } else {
+                      stopAudio();
+                      stateLabel.setText("STOPPED", juce::dontSendNotification);
+                      startButton.setButtonText("Start");
+                  }
+              };
+              settingsButton.onClick = [this] { showAudioSettings(); };
+              setSize(720, 800);
+              startTimerHz(20);
+          }
+          MainComponent::~MainComponent() { stopTimer(); stopAudio(); }
+
+          void MainComponent::showAudioSettings() {
+              auto* sel = new juce::AudioDeviceSelectorComponent(deviceManager, 1, 2, 2, 2, false, false, true, false);
+              sel->setSize(500, 400);
+              juce::DialogWindow::LaunchOptions o;
+              o.content.setOwned(sel);
+              o.dialogTitle = "Audio Routing";
+              o.dialogBackgroundColour = juce::Colours::darkgrey;
+              o.escapeKeyTriggersCloseButton = true;
+              o.useNativeTitleBar = true;
+              o.resizable = false;
+              o.launchAsync();
+          }
+
+          void MainComponent::resetMixerSliders() {
+              channelSliders.clear();
+              channelLabels.clear();
+              for (int i = 0; i < 16; ++i) channelIds[i] = -1;
+              instrumentsLabel.setText("Instruments: -", juce::dontSendNotification);
+              resized();
+          }
+
+          void MainComponent::startAudio() {
+              if (deviceManager.getCurrentAudioDevice()) return;
+              resetMixerSliders();
+              chordInference.clear();
+              pendingNotesForSend.clear();
+              auto err = deviceManager.initialiseWithDefaultDevices(1, 2);
+              if (err.isNotEmpty()) { stateLabel.setText("AUDIO ERROR: " + err, juce::dontSendNotification); return; }
+              deviceManager.addAudioCallback(this);
+              arranger = std::make_unique<Arranger>();
+              arranger->start();
+              scheduler.start();
+              startButton.setButtonText("Stop");
+              stateLabel.setText("CONNECTING...", juce::dontSendNotification);
+          }
+          void MainComponent::stopAudio() {
+              if (arranger) { arranger->stop(); arranger.reset(); }
+              if (deviceManager.getCurrentAudioDevice()) {
+                  deviceManager.removeAudioCallback(this);
+                  deviceManager.closeAudioDevice();
+              }
+              scheduler.stop();
+              synth.allNotesOff();
+          }
+          void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* d) {
+              const double sr = d->getCurrentSampleRate();
+              currentSampleRate.store(sr);
+              pitchDetector = std::make_unique<PitchDetector>();
+              pitchDetector->prepare(sr);
+              noteTracker.setBeatsPerBar(4);
+              noteTracker.resetAudioClock();
+              scheduler.setSampleRate(sr);
+              synth.initialize(sr);
+              synth.prepareLimiterForBlock(juce::jmax(4096, d->getCurrentBufferSizeSamples()));
+          }
+          void MainComponent::audioDeviceStopped() { pitchDetector.reset(); }
+
+          void MainComponent::audioDeviceIOCallbackWithContext(
+              const float* const* in, int nIn, float* const* out, int nOut, int n,
+              const juce::AudioIODeviceCallbackContext&)
+          {
+              const bool hasMic = (nIn > 0 && in != nullptr && in[0] != nullptr && n > 0);
+              float micRms = 0.0f;
+              if (hasMic) {
+                  if (pitchDetector) pitchDetector->feed(in[0], n);
+                  double sq = 0.0;
+                  for (int i = 0; i < n; ++i) sq += (double)in[0][i] * (double)in[0][i];
+                  micRms = (float)std::sqrt(sq / (double)n);
+              }
+              currentEnergy.store(micRms);
+
+              auto frame = pitchDetector ? pitchDetector->latestFrame() : PitchDetector::Frame{};
+              frame.rms = micRms;
+
+              static thread_local float prevBand[4096];
+              static thread_local int prevBandN = 0;
+              int m = juce::jmin(n, prevBandN);
+              if (hasMic && m > 0 && !headphonesOn.load()) {
+                  double sm = 0, sb = 0, smb = 0, sm2 = 0, sb2 = 0;
+                  for (int i = 0; i < m; ++i) {
+                      double a = in[0][i], b = prevBand[i];
+                      sm += a; sb += b; smb += a * b; sm2 += a * a; sb2 += b * b;
+                  }
+                  double num = m * smb - sm * sb;
+                  double den = std::sqrt((m * sm2 - sm * sm) * (m * sb2 - sb * sb));
+                  double r = den > 1e-9 ? num / den : 0.0;
+                  bleedCorrelation.store((float)r);
+                  if (r > 0.6) frame.voiced = false;
+              } else {
+                  bleedCorrelation.store(0.0f);
+              }
+
+              currentFreq.store(frame.voiced ? frame.frequency : 0.0f);
+              currentConfidence.store(frame.confidence);
+              noteTracker.processBlockFrames(frame, scheduler.getBeatPosition(), scheduler.getCurrentBar(),
+                                             n, currentSampleRate.load());
+
+              scheduler.processBlock(n, synth);
+              if (nOut >= 1 && out != nullptr && out[0] != nullptr) {
+                  synth.render(out[0], (nOut >= 2 ? out[1] : nullptr), n);
+                  int copy = juce::jmin(n, 4096);
+                  for (int i = 0; i < copy; ++i) prevBand[i] = out[0][i];
+                  prevBandN = copy;
+                  double sse = 0.0;
+                  for (int i = 0; i < n; ++i) sse += (double)out[0][i] * (double)out[0][i];
+                  lastBandRms.store((float)std::sqrt(sse / (double)n));
+              }
+              for (int ch = 2; ch < nOut; ++ch)
+                  if (out != nullptr && out[ch] != nullptr) juce::FloatVectorOperations::clear(out[ch], n);
+          }
+
+          void MainComponent::rebuildMixerFromSnapshot(const InstrumentSnapshot& snap) {
+              bool changed = false;
+              for (int ch = 0; ch < 16; ++ch) {
+                  int want = snap.ch[ch].present ? ch : -1;
+                  if (want != channelIds[ch]) { changed = true; break; }
+              }
+              if (!changed) return;
+
+              channelSliders.clear();
+              channelLabels.clear();
+              for (int ch = 0; ch < 16; ++ch) {
+                  channelIds[ch] = snap.ch[ch].present ? ch : -1;
+                  if (!snap.ch[ch].present) continue;
+                  auto* s = new juce::Slider();
+                  s->setRange(0.0, 1.0, 0.01);
+                  s->setValue(1.0);
+                  s->setSliderStyle(juce::Slider::LinearVertical);
+                  s->setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+                  int capturedCh = ch;
+                  s->onValueChange = [this, capturedCh, s] {
+                      scheduler.queueSliderChange(capturedCh, (float)s->getValue());
+                  };
+                  addAndMakeVisible(s);
+                  channelSliders.add(s);
+                  auto* l = new juce::Label();
+                  juce::String name = (ch == 9) ? "Drums" :
+                      juce::String(GM_NAMES[juce::jlimit(0, 127, snap.ch[ch].preset)]);
+                  l->setText(name, juce::dontSendNotification);
+                  styleLabel(*l, 11.0f, juce::Colours::white);
+                  addAndMakeVisible(l);
+                  channelLabels.add(l);
+              }
+              resized();
+          }
+
+          void MainComponent::sendState(bool phraseEnd) {
+              if (!arranger) return;
+              juce::var root(new juce::DynamicObject());
+              auto* o = root.getDynamicObject();
+              o->setProperty("type", "state");
+              o->setProperty("ts", juce::Time::getMillisecondCounterHiRes());
+              o->setProperty("singing", noteTracker.isSinging());
+              o->setProperty("loudness", noteTracker.getLoudness());
+              o->setProperty("loudnessTrend", noteTracker.getLoudnessTrend());
+              o->setProperty("tempo", scheduler.getTempo());
+              o->setProperty("bar", scheduler.getCurrentBar());
+              o->setProperty("beat", scheduler.getBeatPosition());
+              o->setProperty("chord", chordInference.getChord());
+              int kpc = userKeyPc.load();
+              o->setProperty("key", juce::String(GM_KEYS[kpc]));
+              o->setProperty("keyMode", userKeyMinor.load() ? "minor" : "major");
+              o->setProperty("keyConfidence", userKeyConf.load());
+              o->setProperty("userTempo", userTempoBpm.load());
+              o->setProperty("userTempoConfidence", userTempoConf.load());
+              o->setProperty("style", "pop");
+              o->setProperty("phraseEnd", phraseEnd);
+
+              juce::Array<juce::var> jnotes;
+              for (auto& e : pendingNotesForSend) {
+                  juce::var nv(new juce::DynamicObject());
+                  auto* no = nv.getDynamicObject();
+                  no->setProperty("bar", e.bar);
+                  no->setProperty("beat", e.beat);
+                  no->setProperty("midi", e.midi);
+                  no->setProperty("velocity", e.velocity);
+                  no->setProperty("duration", e.durationBeats);
+                  no->setProperty("confidence", e.confidence);
+                  jnotes.add(nv);
+              }
+              o->setProperty("notes", juce::var(jnotes));
+              pendingNotesForSend.clear();
+              arranger->sendStateJson(juce::JSON::toString(root, false));
+          }
+
+          void MainComponent::timerCallback() {
+              auto events = noteTracker.drainEvents();
+              for (auto& e : events) {
+                  chordInference.addNote(e.midi);
+                  keyEstimator.addNoteDuration(e.midi, e.durationBeats);
+                  tempoEstimator.addOnset(e.onsetTimeSec);
+                  if (pendingNotesForSend.size() < 64) pendingNotesForSend.push_back(e);
+              }
+              auto kr = keyEstimator.estimate();
+              userKeyPc.store(kr.tonic);
+              userKeyMinor.store(kr.isMinor ? 1 : 0);
+              userKeyConf.store(kr.confidence);
+              auto tr = tempoEstimator.estimate();
+              userTempoBpm.store((float)tr.bpm);
+              userTempoConf.store(tr.confidence);
+
+              if (arranger) {
+                  auto incoming = arranger->drainPlans();
+                  for (auto& sp : incoming) {
+                      RawPlan rp;
+                      rp.bar = sp->bar;
+                      rp.tempo = sp->tempo;
+                      rp.numEvents = juce::jmin((int)sp->events.size(), kMaxEventsPerBar);
+                      for (int i = 0; i < rp.numEvents; ++i)
+                          rp.events[i] = { sp->events[i].beat, sp->events[i].channel, sp->events[i].midi,
+                                           sp->events[i].velocity, sp->events[i].duration };
+                      for (int ch = 0; ch < 16; ++ch) rp.mixer[ch] = sp->mixer[ch];
+                      scheduler.queuePlan(rp);
+                  }
+              }
+
+              float f = currentFreq.load(), conf = currentConfidence.load(), e = currentEnergy.load();
+              if (f > 0.0f && conf > 0.4f) {
+                  noteLabel.setText(PitchDetector::freqToNote(f), juce::dontSendNotification);
+                  chordLabel.setText(chordInference.getChord(), juce::dontSendNotification);
+                  stateLabel.setText("SINGING", juce::dontSendNotification);
+                  stateLabel.setColour(juce::Label::textColourId, juce::Colours::cyan);
+              } else if (e > 0.02f) {
+                  noteLabel.setText("-", juce::dontSendNotification);
+                  chordLabel.setText("-", juce::dontSendNotification);
+                  stateLabel.setText("NO PITCH", juce::dontSendNotification);
+                  stateLabel.setColour(juce::Label::textColourId, juce::Colours::yellow);
+              } else if (scheduler.isCountingIn()) {
+                  stateLabel.setText("COUNT-IN...", juce::dontSendNotification);
+                  stateLabel.setColour(juce::Label::textColourId, juce::Colours::orange);
+              } else if (scheduler.isRunning()) {
+                  stateLabel.setText("PLAYING", juce::dontSendNotification);
+                  stateLabel.setColour(juce::Label::textColourId, juce::Colours::green);
+              } else {
+                  stateLabel.setText("STOPPED", juce::dontSendNotification);
+                  stateLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
+              }
+              juce::String keyStr = juce::String(GM_KEYS[userKeyPc.load()])
+                                  + (userKeyMinor.load() ? " minor" : " major");
+              keyLabel.setText("Key: " + keyStr + " (" + juce::String((int)(userKeyConf.load() * 100)) + "%)",
+                               juce::dontSendNotification);
+              tempoLabel.setText("Band: " + juce::String((int)scheduler.getTempo()) + " BPM | You: "
+                                 + juce::String((int)userTempoBpm.load()) + " BPM ("
+                                 + juce::String((int)(userTempoConf.load() * 100)) + "%)",
+                                 juce::dontSendNotification);
+
+              auto snap = scheduler.getInstrumentSnapshot();
+              juce::StringArray parts;
+              for (int ch = 0; ch < 16; ++ch) {
+                  if (!snap.ch[ch].present) continue;
+                  juce::String name = (ch == 9) ? "Drums" : juce::String(GM_NAMES[juce::jlimit(0,127,snap.ch[ch].preset)]);
+                  parts.add("ch" + juce::String(ch) + ": " + name);
+              }
+              instrumentsLabel.setText(parts.isEmpty() ? "Instruments: -" : parts.joinIntoString(" | "),
+                                       juce::dontSendNotification);
+              rebuildMixerFromSnapshot(snap);
+
+              float bc = bleedCorrelation.load();
+              bleedLabel.setText(bc > 0.6f ? "Mic bleed detected (use headphones or toggle above)"
+                                           : "", juce::dontSendNotification);
+              headphoneLabel.setVisible(bc <= 0.6f);
+
+              if (arranger) {
+                  if (arranger->isConnected())
+                      rttLabel.setText("RTT: " + juce::String((int)arranger->getRttMs()) + " ms", juce::dontSendNotification);
+                  else
+                      rttLabel.setText("OFFLINE (looping last bar)", juce::dontSendNotification);
+                  const double now = juce::Time::getMillisecondCounterHiRes();
+                  bool phraseEnd = noteTracker.drainPhraseEnd();
+                  if (phraseEnd || (now - lastSendMs >= 100.0)) {
+                      lastSendMs = now;
+                      sendState(phraseEnd);
+                  }
+                  if (now >= (double)nextPingMs) {
+                      nextPingMs = (int64_t)now + 3000;
+                      if (arranger->isConnected()) {
+                          juce::var pv(new juce::DynamicObject());
+                          pv.getDynamicObject()->setProperty("type", "ping");
+                          pv.getDynamicObject()->setProperty("ts", now);
+                          arranger->sendStateJson(juce::JSON::toString(pv, false));
+                      }
+                  }
+              }
+              repaint();
+          }
+
+          void MainComponent::paint(juce::Graphics& g) {
+              g.fillAll(juce::Colour::fromRGB(10, 12, 18));
+              auto c = getLocalBounds().getCentre();
+              float r = 70.0f + currentEnergy.load() * 200.0f;
+              juce::ColourGradient grad(juce::Colour::fromRGB(0,255,200).withAlpha(0.2f),
+                                        (float)c.x, (float)c.y,
+                                        juce::Colours::black.withAlpha(0.0f),
+                                        (float)c.x + r, (float)c.y, true);
+              g.setGradientFill(grad);
+              g.fillEllipse((float)c.x - r, (float)c.y - r, r * 2, r * 2);
+          }
+
+          void MainComponent::resized() {
+              auto area = getLocalBounds().reduced(16);
+              auto top = area.removeFromTop(26);
+              stateLabel.setBounds(top.removeFromLeft(top.getWidth() * 2 / 3));
+              rttLabel.setBounds(top);
+              area.removeFromTop(6);
+              noteLabel.setBounds(area.removeFromTop(64));
+              chordLabel.setBounds(area.removeFromTop(42));
+              keyLabel.setBounds(area.removeFromTop(24));
+              instrumentsLabel.setBounds(area.removeFromTop(20));
+              bleedLabel.setBounds(area.removeFromTop(20));
+              headphoneLabel.setBounds(area.removeFromTop(20));
+              auto tempoRow = area.removeFromTop(32);
+              tempoLabel.setBounds(tempoRow.removeFromLeft(tempoRow.getWidth() * 2 / 3));
+              tempoSlider.setBounds(tempoRow.removeFromLeft(200).reduced(2));
+              auto hpRow = area.removeFromTop(26);
+              headphonesToggle.setBounds(hpRow.removeFromLeft(160));
+              auto buttons = area.removeFromBottom(46);
+              startButton.setBounds(buttons.removeFromLeft(buttons.getWidth() / 2).reduced(6));
+              settingsButton.setBounds(buttons.reduced(6));
+              auto mixer = area.removeFromBottom(160);
+              int n = channelSliders.size();
+              if (n > 0) {
+                  int w = mixer.getWidth() / n;
+                  for (int i = 0; i < n; ++i) {
+                      auto cell = mixer.removeFromLeft(w).reduced(4);
+                      channelLabels[i]->setBounds(cell.removeFromBottom(16));
+                      channelSliders[i]->setBounds(cell);
+                  }
+              }
+          }
+          EOF
+
+          cat > Source/Main.cpp << 'EOF'
+          #include <JuceHeader.h>
+          #include "MainComponent.h"
+          class AILiveBandApplication : public juce::JUCEApplication {
+          public:
+              const juce::String getApplicationName() override    { return "AI Live Band"; }
+              const juce::String getApplicationVersion() override { return "0.4.0"; }
+              bool moreThanOneInstanceAllowed() override          { return true; }
+              void initialise(const juce::String&) override { mainWindow.reset(new MainWindow(getApplicationName())); }
+              void shutdown() override { mainWindow.reset(); }
+              void systemRequestedQuit() override { quit(); }
+              class MainWindow : public juce::DocumentWindow {
+              public:
+                  explicit MainWindow(juce::String name) : DocumentWindow(name, juce::Colours::black,
+                      #if JUCE_ANDROID
+                      0
+                      #else
+                      DocumentWindow::allButtons
+                      #endif
+                  ) {
+                      #if !JUCE_ANDROID
+                      setUsingNativeTitleBar(true); setResizable(true, true);
+                      #endif
+                      setContentOwned(new MainComponent(), true);
+                      #if JUCE_ANDROID
+                      setFullScreen(true);
+                      #else
+                      centreWithSize(getWidth(), getHeight());
+                      #endif
+                      setVisible(true);
+                  }
+                  void closeButtonPressed() override { JUCEApplication::getInstance()->systemRequestedQuit(); }
+              };
+          private:
+              std::unique_ptr<MainWindow> mainWindow;
+          };
+          START_JUCE_APPLICATION(AILiveBandApplication)
+          EOF
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: AILiveBand-source
+          name: source
+          if-no-files-found: error
           path: |
-            Source/
             CMakeLists.txt
             AILiveBand.jucer
+            Source/
 
+  # ─────────────────────────────────────────────
+  # 1. LINUX
+  # ─────────────────────────────────────────────
   build-linux:
     needs: scaffold
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          name: AILiveBand-source
-      - uses: actions/checkout@v4
-        with:
-          repository: juce-framework/JUCE
-          ref: ${{ env.JUCE_VERSION }}
-          path: JUCE
-      - name: Install Linux dependencies
+        with: { name: source }
+      - name: Cache JUCE
+        id: cache-juce
+        uses: actions/cache@v4
+        with: { path: JUCE, key: "${{ runner.os }}-juce-${{ env.JUCE_VERSION }}" }
+      - name: Clone JUCE
+        if: steps.cache-juce.outputs.cache-hit != 'true'
+        run: git clone --branch ${{ env.JUCE_VERSION }} --depth 1 https://github.com/juce-framework/JUCE.git
+      - name: Write config
+        env:
+          SERVER_URL:   ${{ secrets.AI_LIVE_BAND_SERVER_URL }}
+          SERVER_TOKEN: ${{ secrets.AI_LIVE_BAND_ACCESS_TOKEN }}
+        run: |
+          [ -n "$SERVER_URL" ] || { echo "::error::AI_LIVE_BAND_SERVER_URL secret missing"; exit 1; }
+          [ -n "$SERVER_TOKEN" ] || { echo "::error::AI_LIVE_BAND_ACCESS_TOKEN secret missing"; exit 1; }
+          printf '#pragma once\n#define AI_LIVE_BAND_SERVER_URL "%s"\n#define AI_LIVE_BAND_ACCESS_TOKEN "%s"\n' \
+            "$SERVER_URL" "$SERVER_TOKEN" > Source/Config.h
+      - name: Install Linux deps
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake ninja-build pkg-config \
             libasound2-dev libjack-jackd2-dev ladspa-sdk libcurl4-openssl-dev \
-            libfreetype6-dev libfontconfig1-dev libx11-dev libxcomposite-dev \
-            libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev \
-            libxrender-dev libxi-dev libglu1-mesa-dev mesa-common-dev libegl-dev
-      - name: Build Linux
+            libfreetype-dev libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev \
+            libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libxi-dev \
+            libglu1-mesa-dev mesa-common-dev libegl-dev
+      - name: Configure & Build
         run: |
+          rm -rf build
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release -j2
-      - name: Package Linux
+          cmake --build build --config Release
+      - name: Package
         run: |
-          tar -czf AILiveBand-linux.tar.gz \
-            -C build/AILiveBand_artefacts/Release "AI Live Band"
+          ls -la build/AILiveBand_artefacts/Release/
+          tar -czf AILiveBand-linux.tar.gz -C build/AILiveBand_artefacts/Release "AI Live Band"
       - uses: actions/upload-artifact@v4
-        with:
-          name: AILiveBand-linux
-          path: AILiveBand-linux.tar.gz
+        with: { name: AILiveBand-linux, path: AILiveBand-linux.tar.gz, if-no-files-found: error }
 
+  # ─────────────────────────────────────────────
+  # 2. WINDOWS
+  # ─────────────────────────────────────────────
   build-windows:
     needs: scaffold
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          name: AILiveBand-source
-      - uses: actions/checkout@v4
-        with:
-          repository: juce-framework/JUCE
-          ref: ${{ env.JUCE_VERSION }}
-          path: JUCE
+        with: { name: source }
+      - name: Cache JUCE
+        id: cache-juce
+        uses: actions/cache@v4
+        with: { path: JUCE, key: "${{ runner.os }}-juce-${{ env.JUCE_VERSION }}" }
+      - name: Clone JUCE
+        if: steps.cache-juce.outputs.cache-hit != 'true'
+        run: git clone --branch ${{ env.JUCE_VERSION }} --depth 1 https://github.com/juce-framework/JUCE.git
+      - name: Write config
+        shell: bash
+        env:
+          SERVER_URL:   ${{ secrets.AI_LIVE_BAND_SERVER_URL }}
+          SERVER_TOKEN: ${{ secrets.AI_LIVE_BAND_ACCESS_TOKEN }}
+        run: |
+          [ -n "$SERVER_URL" ] || { echo "::error::AI_LIVE_BAND_SERVER_URL secret missing"; exit 1; }
+          [ -n "$SERVER_TOKEN" ] || { echo "::error::AI_LIVE_BAND_ACCESS_TOKEN secret missing"; exit 1; }
+          printf '#pragma once\n#define AI_LIVE_BAND_SERVER_URL "%s"\n#define AI_LIVE_BAND_ACCESS_TOKEN "%s"\n' \
+            "$SERVER_URL" "$SERVER_TOKEN" > Source/Config.h
       - uses: ilammy/msvc-dev-cmd@v1
-      - uses: seanmiddleditch/gha-setup-ninja@v5
-      - name: Build Windows
+      - name: Configure & Build
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release -j2
+          cmake --build build --config Release
       - uses: actions/upload-artifact@v4
         with:
           name: AILiveBand-windows
           path: build/AILiveBand_artefacts/Release/AI Live Band.exe
+          if-no-files-found: error
 
+  # ─────────────────────────────────────────────
+  # 3. MACOS
+  # ─────────────────────────────────────────────
   build-macos:
     needs: scaffold
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          name: AILiveBand-source
-      - uses: actions/checkout@v4
-        with:
-          repository: juce-framework/JUCE
-          ref: ${{ env.JUCE_VERSION }}
-          path: JUCE
+        with: { name: source }
+      - name: Cache JUCE
+        id: cache-juce
+        uses: actions/cache@v4
+        with: { path: JUCE, key: "${{ runner.os }}-juce-${{ env.JUCE_VERSION }}" }
+      - name: Clone JUCE
+        if: steps.cache-juce.outputs.cache-hit != 'true'
+        run: git clone --branch ${{ env.JUCE_VERSION }} --depth 1 https://github.com/juce-framework/JUCE.git
+      - name: Write config
+        env:
+          SERVER_URL:   ${{ secrets.AI_LIVE_BAND_SERVER_URL }}
+          SERVER_TOKEN: ${{ secrets.AI_LIVE_BAND_ACCESS_TOKEN }}
+        run: |
+          [ -n "$SERVER_URL" ] || { echo "::error::AI_LIVE_BAND_SERVER_URL secret missing"; exit 1; }
+          [ -n "$SERVER_TOKEN" ] || { echo "::error::AI_LIVE_BAND_ACCESS_TOKEN secret missing"; exit 1; }
+          printf '#pragma once\n#define AI_LIVE_BAND_SERVER_URL "%s"\n#define AI_LIVE_BAND_ACCESS_TOKEN "%s"\n' \
+            "$SERVER_URL" "$SERVER_TOKEN" > Source/Config.h
       - name: Install Ninja
-        run: brew install ninja
-      - name: Build macOS
+        run: brew install ninja || true
+      - name: Configure & Build
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
-          cmake --build build --config Release -j2
-      - name: Package macOS
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          cmake --build build --config Release
+      - name: Package
         run: |
-          tar -czf AILiveBand-macos.tar.gz \
-            -C build/AILiveBand_artefacts/Release "AI Live Band.app"
+          ls -la build/AILiveBand_artefacts/Release/
+          tar -czf AILiveBand-macos.tar.gz -C build/AILiveBand_artefacts/Release "AI Live Band.app"
       - uses: actions/upload-artifact@v4
-        with:
-          name: AILiveBand-macos
-          path: AILiveBand-macos.tar.gz
+        with: { name: AILiveBand-macos, path: AILiveBand-macos.tar.gz, if-no-files-found: error }
 
+  # ─────────────────────────────────────────────
+  # 4. ANDROID
+  # ─────────────────────────────────────────────
   build-android:
     needs: scaffold
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          name: AILiveBand-source
-
-      - uses: actions/checkout@v4
-        with:
-          repository: juce-framework/JUCE
-          ref: ${{ env.JUCE_VERSION }}
-          path: JUCE
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Install Android SDK and NDK
+        with: { name: source }
+      - name: Cache Gradle Wrapper
+        uses: actions/cache@v4
+        with: { path: ~/.gradle/wrapper/dists, key: "${{ runner.os }}-gradle-wrapper-v1" }
+      - name: Cache JUCE
+        id: cache-juce
+        uses: actions/cache@v4
+        with: { path: JUCE, key: "${{ runner.os }}-juce-${{ env.JUCE_VERSION }}" }
+      - name: Clone JUCE
+        if: steps.cache-juce.outputs.cache-hit != 'true'
+        run: git clone --branch ${{ env.JUCE_VERSION }} --depth 1 https://github.com/juce-framework/JUCE.git
+      - name: Write config
+        env:
+          SERVER_URL:   ${{ secrets.AI_LIVE_BAND_SERVER_URL }}
+          SERVER_TOKEN: ${{ secrets.AI_LIVE_BAND_ACCESS_TOKEN }}
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "ndk;${ANDROID_NDK_VERSION}"
-
-      - name: Install Projucer build dependencies
+          [ -n "$SERVER_URL" ] || { echo "::error::AI_LIVE_BAND_SERVER_URL secret missing"; exit 1; }
+          [ -n "$SERVER_TOKEN" ] || { echo "::error::AI_LIVE_BAND_ACCESS_TOKEN secret missing"; exit 1; }
+          printf '#pragma once\n#define AI_LIVE_BAND_SERVER_URL "%s"\n#define AI_LIVE_BAND_ACCESS_TOKEN "%s"\n' \
+            "$SERVER_URL" "$SERVER_TOKEN" > Source/Config.h
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: Install Android SDK components
+        run: |
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          SDKMANAGER="$(command -v sdkmanager || ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n 1)"
+          yes | "$SDKMANAGER" --licenses --sdk_root="$ANDROID_HOME" > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "ndk;$ANDROID_NDK_VERSION" "platforms;android-34" "build-tools;34.0.0"
+      - name: Install Host Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build \
-            libx11-dev libxext-dev libxrandr-dev libxinerama-dev \
-            libxcursor-dev libfreetype6-dev libfontconfig1-dev \
-            libasound2-dev libjack-jackd2-dev ladspa-sdk
-
-      - name: Build IXWebSocket for Android ABIs
+          sudo apt-get install -y ninja-build libcurl4-openssl-dev \
+            libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+            libfreetype6-dev libfontconfig1-dev libasound2-dev libjack-jackd2-dev \
+            ladspa-sdk libwebkit2gtk-4.1-dev libgtk-3-dev libglu1-mesa-dev mesa-common-dev libegl-dev
+      - name: Pre-build IXWebSocket for Android (all ABIs)
         run: |
-          git clone --depth 1 --branch v11.4.4 \
-            https://github.com/machinezone/IXWebSocket.git ixwebsocket-src
-
-          NDK_TOOLCHAIN="$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}/build/cmake/android.toolchain.cmake"
+          git clone --depth 1 --branch v11.4.4 https://github.com/machinezone/IXWebSocket.git ixwebsocket-src
           mkdir -p ixwebsocket-android/libs ixwebsocket-android/include
-
+          NDK_TOOLCHAIN="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/build/cmake/android.toolchain.cmake"
+          test -f "$NDK_TOOLCHAIN" || (echo "::error::NDK toolchain not found" && exit 1)
           for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
             cmake -S ixwebsocket-src -B "ixwebsocket-src/build-${ABI}" \
               -DCMAKE_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
-              -DANDROID_ABI="$ABI" \
-              -DANDROID_PLATFORM=android-24 \
-              -DUSE_TLS=OFF \
-              -DUSE_ZLIB=OFF \
-              -DUSE_TEST=OFF \
-              -DUSE_WS=ON \
-              -DBUILD_SHARED_LIBS=OFF \
+              -DANDROID_ABI="$ABI" -DANDROID_PLATFORM=android-24 \
+              -DUSE_TLS=OFF -DUSE_ZLIB=OFF -DUSE_TEST=OFF -DUSE_WS=OFF \
+              -DBUILD_SHARED_LIBS=OFF -DCMAKE_CXX_STANDARD=17 \
               -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-              -DCMAKE_BUILD_TYPE=Release
-
-            cmake --build "ixwebsocket-src/build-${ABI}" \
-              --target ixwebsocket -j2
-
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release
+            cmake --build "ixwebsocket-src/build-${ABI}" --target ixwebsocket -j"$(nproc)"
             mkdir -p "ixwebsocket-android/libs/${ABI}"
-            find "ixwebsocket-src/build-${ABI}" -name "libixwebsocket.a" \
-              -exec cp {} "ixwebsocket-android/libs/${ABI}/" \;
-
-            test -f "ixwebsocket-android/libs/${ABI}/libixwebsocket.a"
+            find "ixwebsocket-src/build-${ABI}" -name "libixwebsocket.a" -exec cp {} "ixwebsocket-android/libs/${ABI}/" \;
+            test -f "ixwebsocket-android/libs/${ABI}/libixwebsocket.a" || (echo "::error::libixwebsocket.a missing for ${ABI}" && exit 1)
           done
-
           cp -r ixwebsocket-src/ixwebsocket ixwebsocket-android/include/
-
-      - name: Build Projucer
+          find ixwebsocket-android -name "*.a"
+      - name: Build Projucer CLI
         run: |
           cd JUCE/extras/Projucer/Builds/LinuxMakefile
-          make -j2 CONFIG=Release
-          echo "$GITHUB_WORKSPACE/JUCE/extras/Projucer/Builds/LinuxMakefile/build" >> "$GITHUB_PATH"
-
-      - name: Generate Android project
+          make -j"$(nproc)" CONFIG=Release
+          echo "$GITHUB_WORKSPACE/JUCE/extras/Projucer/Builds/LinuxMakefile/build" >> $GITHUB_PATH
+      - name: Generate Android Gradle Project via Projucer
         run: |
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          sed -i "s|IXWEBSOCKET_INCLUDE_PATH|$GITHUB_WORKSPACE/ixwebsocket-android/include|g" AILiveBand.jucer
           Projucer --set-global-search-path linux defaultJuceModulePath "$GITHUB_WORKSPACE/JUCE/modules"
           Projucer --set-global-search-path linux androidSDKPath "$ANDROID_HOME"
           Projucer --resave AILiveBand.jucer
+          ls -la Builds/Android/ || (echo "::error::Builds/Android not found" && exit 1)
 
-          test -f Builds/Android/app/CMakeLists.txt
-          test -f Builds/Android/gradlew
-
-      - name: Patch Android project
-        run: |
-          set -e
           CMAKE_FILE="Builds/Android/app/CMakeLists.txt"
-          MANIFEST="Builds/Android/app/src/main/AndroidManifest.xml"
-
-          python3 - "$CMAKE_FILE" "$GITHUB_WORKSPACE" <<'PY'
-          import sys
-          path, root = sys.argv[1], sys.argv[2]
-          text = open(path).read()
-
-          if "ixwebsocket-android" not in text:
-              text += f'''
-          include_directories("{root}/ixwebsocket-android/include")
-          add_library(ixwebsocket STATIC IMPORTED)
-          set_target_properties(ixwebsocket PROPERTIES
-            IMPORTED_LOCATION "{root}/ixwebsocket-android/libs/${{ANDROID_ABI}}/libixwebsocket.a")
-          '''
-              text += '''
-          if(TARGET AILiveBand)
-            target_link_libraries(AILiveBand PRIVATE ixwebsocket)
-          endif()
-          '''
-          open(path, "w").write(text)
+          if [ -f "$CMAKE_FILE" ]; then
+            python3 - "$CMAKE_FILE" "$GITHUB_WORKSPACE" <<'PY'
+          import re, sys
+          path, ws = sys.argv[1], sys.argv[2]
+          lines = open(path).read().split("\n")
+          lines = [l for l in lines if not re.search(r"target_link_libraries.*AILiveBand", l)]
+          abi_var = "$" + "{ANDROID_ABI}"
+          inject = [
+              'function(target_link_libraries)',
+              '  if(TARGET "${ARGV0}")',
+              '    _target_link_libraries(${ARGV})',
+              '  else()',
+              '    message(WARNING "Skipping target_link_libraries for missing target ${ARGV0}")',
+              '  endif()',
+              'endfunction()',
+              'include_directories("%s/ixwebsocket-android/include")' % ws,
+              'link_libraries("%s/ixwebsocket-android/libs/%s/libixwebsocket.a")' % (ws, abi_var),
+          ]
+          idx = None
+          for i, l in enumerate(lines):
+              if re.match(r"^\s*project\s*\(", l, re.I):
+                  idx = i; break
+          if idx is None:
+              for i, l in enumerate(lines):
+                  if re.match(r"^\s*cmake_minimum_required\s*\(", l, re.I):
+                      idx = i; break
+          if idx is None: lines = inject + lines
+          else: lines = lines[:idx + 1] + inject + lines[idx + 1:]
+          open(path, "w").write("\n".join(lines))
           PY
+            grep -n "ixwebsocket" "$CMAKE_FILE" || (echo "::error::CMake patch did not apply" && exit 1)
+          else
+            echo "::error::$CMAKE_FILE not found" && exit 1
+          fi
 
+          MANIFEST_PATH="Builds/Android/app/src/main/AndroidManifest.xml"
           for PERM in RECORD_AUDIO INTERNET; do
-            grep -q "android.permission.$PERM" "$MANIFEST" || \
-              sed -i "/<application/i\\    <uses-permission android:name=\\"android.permission.$PERM\\" />" "$MANIFEST"
+            if ! grep -q "android.permission.$PERM" "$MANIFEST_PATH"; then
+              sed -i "/<application/i \    <uses-permission android:name=\"android.permission.$PERM\" />" "$MANIFEST_PATH"
+            fi
+            grep -q "android.permission.$PERM" "$MANIFEST_PATH" || (echo "::error::$PERM missing" && exit 1)
           done
+          if ! grep -q "usesCleartextTraffic" "$MANIFEST_PATH"; then
+            sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MANIFEST_PATH"
+          fi
 
-          grep -q usesCleartextTraffic "$MANIFEST" || \
-            sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MANIFEST"
-
-      - name: Build Android APK
+          GRADLE_FILE="Builds/Android/app/build.gradle"
+          if [ -f "$GRADLE_FILE" ]; then
+            sed -i '/DANDROID_STL=c++_shared/d' "$GRADLE_FILE"
+            sed -i '/CMAKE_MAKE_PROGRAM/d' "$GRADLE_FILE"
+            if ! grep -q ndkVersion "$GRADLE_FILE"; then
+              sed -i "0,/^android {/s//android {\n    ndkVersion \"$ANDROID_NDK_VERSION\"/" "$GRADLE_FILE"
+            fi
+          fi
+      - name: Prefetch Gradle Distribution with Retries
+        run: |
+          PROPS_FILE="Builds/Android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$PROPS_FILE" ]; then
+            URL=$(sed -n 's/^distributionUrl=//p' "$PROPS_FILE" | sed 's/\\//g')
+            ZIP_NAME=${URL##*/}
+            DIST_NAME=${ZIP_NAME%.zip}
+            HASH=$(python3 - "$URL" <<'PY'
+          import hashlib, sys
+          n = int.from_bytes(hashlib.md5(sys.argv[1].encode()).digest(), "big")
+          d = "0123456789abcdefghijklmnopqrstuvwxyz"
+          s = ""
+          while n:
+              n, r = divmod(n, 36)
+              s = d[r] + s
+          print(s)
+          PY
+          )
+            DIST_DIR="$HOME/.gradle/wrapper/dists/$DIST_NAME/$HASH"
+            mkdir -p "$DIST_DIR"
+            if [ ! -f "$DIST_DIR/$ZIP_NAME" ] && [ ! -d "$DIST_DIR/${DIST_NAME%-bin}" ]; then
+              for i in 1 2 3 4 5 6 7 8; do
+                if curl -fsSL --connect-timeout 15 --max-time 300 -o "$DIST_DIR/$ZIP_NAME.part" "$URL" && \
+                   unzip -tq "$DIST_DIR/$ZIP_NAME.part" > /dev/null 2>&1; then
+                  mv "$DIST_DIR/$ZIP_NAME.part" "$DIST_DIR/$ZIP_NAME"
+                  echo "OK: Gradle distribution downloaded (attempt $i)"; break
+                fi
+                echo "WARN: Download failed (attempt $i/8), retrying in 15s..."
+                rm -f "$DIST_DIR/$ZIP_NAME.part"
+                sleep 15
+              done
+            fi
+          fi
+      - name: Create debug keystore
+        run: |
+          mkdir -p ~/.android
+          keytool -genkey -v -keystore ~/.android/debug.keystore -storepass android \
+            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+      - name: Build APK with Gradle
         run: |
           cd Builds/Android
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace
-
-      - name: Find and copy APK
+      - name: Verify IXWebSocket is linked
         run: |
-          APK=$(find Builds/Android -type f -name "*debug*.apk" | head -n 1)
-          test -n "$APK"
-          cp "$APK" "$GITHUB_WORKSPACE/AILiveBand.apk"
-
-      - name: Upload Android APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: AILiveBand-android
-          path: AILiveBand.apk
-          if-no-files-found: error
+          APK_PATH=$(find Builds/Android -name "*.apk" -type f | head -n 1)
+          test -n "$APK_PATH" || (echo "::error::No APK" && exit 1)
+          mkdir -p apk_check
+          unzip -o "$APK_PATH" "lib/arm64-v8a/*.so" -d apk_check
+          if grep -aq "Sec-WebSocket-Key" apk_check/lib/arm64-v8a/*.so; then echo "OK: IXWebSocket code found."
+          else echo "::error::IXWebSocket NOT found" && exit 1; fi
+      - name: Locate and Copy APK
+        run: |
+          APK_PATH=$(find Builds/Android -name "*.apk" -type f | head -n 1)
+          if [ -n "$APK_PATH" ]; then cp "$APK_PATH" ./AILiveBand.apk
+          else echo "::error::No APK generated" && exit 1; fi
+      - uses: actions/upload-artifact@v4
+        with: { name: AILiveBand-android, path: ./AILiveBand.apk, if-no-files-found: error }
