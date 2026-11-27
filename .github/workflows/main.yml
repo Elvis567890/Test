@@ -19,12 +19,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Download SoundFont and TinySoundFont
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download TinySoundFont and Validate Repository SoundFont
         run: |
           set -euo pipefail
 
           TSF_URLS="https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h https://raw.githubusercontent.com/schellingb/TinySoundFont/HEAD/tsf.h https://raw.githubusercontent.com/schellingb/TinySoundFont/main/tsf.h"
-          SF_URLS="https://raw.githubusercontent.com/schellingb/TinySoundFont/master/soundfont.sf2 https://raw.githubusercontent.com/schellingb/TinySoundFont/HEAD/soundfont.sf2 https://raw.githubusercontent.com/musescore/MuseScore/master/share/sound/MuseScore_General/MuseScore_General.sf2 https://raw.githubusercontent.com/FluidSynth/fluidsynth/master/sf2/VintageDreamsWaves-v2.sf2 https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2"
 
           got_tsf=0
           for url in $TSF_URLS; do
@@ -46,13 +48,19 @@ jobs:
             exit 1
           fi
 
+          REPO_SF2="assets/SoundFont.sf2"
+          if [ ! -f "$REPO_SF2" ]; then
+            echo "::error::Required SoundFont file '$REPO_SF2' is missing from the repository."
+            exit 1
+          fi
+
           cat > verify_sf2.py <<'PY'
           import os
           import struct
           import sys
 
           path = sys.argv[1]
-          max_bytes = 20 * 1024 * 1024
+          max_bytes = 25 * 1024 * 1024
 
           if not os.path.isfile(path):
               print(f"SoundFont file does not exist: {path}")
@@ -114,28 +122,13 @@ jobs:
               sys.exit(1)
           PY
 
-          got_sf2=0
-          for url in $SF_URLS; do
-            rm -f SoundFont.sf2
-            echo "Trying SoundFont URL: $url"
-            if curl -fsSL --retry 2 --retry-delay 2 -o SoundFont.sf2 "$url"; then
-              if python3 verify_sf2.py SoundFont.sf2; then
-                echo "OK: Downloaded and verified SoundFont.sf2 from $url"
-                got_sf2=1
-                break
-              else
-                echo "SoundFont from $url failed validation; trying next URL..."
-              fi
-            else
-              echo "Failed to download SoundFont from $url; trying next URL..."
-            fi
-          done
-
-          if [ "$got_sf2" != "1" ]; then
-            rm -f SoundFont.sf2
-            echo "::error::Could not download a valid SoundFont under 20 MB with all 128 GM presets and drums from any URL."
+          if ! python3 verify_sf2.py "$REPO_SF2"; then
+            echo "::error::Repository SoundFont '$REPO_SF2' failed SF2 validation."
             exit 1
           fi
+
+          cp "$REPO_SF2" SoundFont.sf2
+          echo "OK: Validated and staged $REPO_SF2"
 
       - name: Create project files
         run: |
@@ -144,18 +137,15 @@ jobs:
           mv tsf.h Source/tsf.h
           mv SoundFont.sf2 Source/SoundFont.sf2
 
-          # ── Config.h (hardcoded once for all build jobs) ──
           cat > Source/Config.h << 'EOF'
           #pragma once
           #define AI_LIVE_BAND_SERVER_URL "ws://13.140.90.83:8765"
           #define AI_LIVE_BAND_ACCESS_TOKEN "ai-live-band-2024"
-          #define AI_LIVE_BAND_SOUNDFONT_URL "https://github.com/urish/cinto/raw/master/media/TimGM6mb.sf2"
           EOF
 
-          # ── CMakeLists.txt (DESKTOP) ──
           cat > CMakeLists.txt << 'EOF'
           cmake_minimum_required(VERSION 3.22)
-          project(AILiveBand VERSION 0.4.0 LANGUAGES C CXX)
+          project(AILiveBand VERSION 0.4.2 LANGUAGES C CXX)
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
           set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
@@ -180,7 +170,7 @@ jobs:
           juce_add_gui_app(AILiveBand
             PRODUCT_NAME "AI Live Band"
             COMPANY_NAME "AILiveBand"
-            VERSION "0.4.0"
+            VERSION "0.4.2"
             MICROPHONE_PERMISSION_ENABLED TRUE
             MICROPHONE_PERMISSION_TEXT "AI Live Band needs microphone access."
           )
@@ -220,10 +210,9 @@ jobs:
           )
           EOF
 
-          # ── AILiveBand.jucer (ANDROID) ──
           cat > AILiveBand.jucer << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
-          <JUCERPROJECT id="AILiveBand" name="AILiveBand" projectType="guiapp" version="0.4.0" companyName="AILiveBand" bundleIdentifier="com.ailiveband">
+          <JUCERPROJECT id="AILiveBand" name="AI Live Band" projectType="guiapp" version="0.4.2" companyName="AILiveBand" bundleIdentifier="com.ailiveband">
             <MAINGROUP id="m" name="AI Live Band">
               <GROUP id="g" name="Source">
                 <FILE id="f1"  name="Main.cpp" compile="1" resource="0" file="Source/Main.cpp"/>
@@ -279,7 +268,6 @@ jobs:
           </JUCERPROJECT>
           EOF
 
-          # ── GMNames.h ──
           cat > Source/GMNames.h << 'EOF'
           #pragma once
           static const char* const GM_NAMES[128] = {
@@ -303,7 +291,7 @@ jobs:
           static const char* const GM_KEYS[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
           EOF
 
-          # ── PitchDetector (64-bit non-overflowing ring counters + adjustable voiced threshold) ──
+          # ── PitchDetector: downsampled to ~12-16 kHz before YIN for fast mobile execution ──
           cat > Source/PitchDetector.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
@@ -321,6 +309,8 @@ jobs:
               PitchDetector();
               ~PitchDetector() override;
               void prepare(double sampleRate);
+              double getInputSampleRate() const { return inputSr; }
+              double getAnalysisSampleRate() const { return analysisSr; }
               void feed(const float* samples, int numSamples);
               void setVoicedThreshold(float rmsThreshold);
               float getVoicedThreshold() const;
@@ -330,15 +320,18 @@ jobs:
               static float midiToFreq(int midi);
           private:
               void run() override;
-              static constexpr int64_t kRingSize = 8192;
-              static constexpr int64_t kWindow   = 2048;
-              static constexpr int64_t kHop      = 512;
+              static constexpr int64_t kRingSize = 16384;
+              static constexpr int64_t kWindow   = 1024;
+              static constexpr int64_t kHop      = 256;
 
               std::array<float, (size_t)kRingSize> ring{};
               std::atomic<int64_t> writePos { 0 };
               std::atomic<int64_t> lastAnalyzed { 0 };
               std::atomic<float>   voicedThreshold { 0.015f };
-              double sr = 44100.0;
+
+              double inputSr = 44100.0;
+              int    decimFactor = 3;
+              double analysisSr = 14700.0;
 
               std::atomic<float> outFreq { 0.0f };
               std::atomic<float> outConf { 0.0f };
@@ -374,7 +367,12 @@ jobs:
           }
 
           void PitchDetector::prepare(double sampleRate) {
-              sr = sampleRate;
+              inputSr = juce::jmax(8000.0, sampleRate);
+              // Target ~12-16 kHz analysis rate (e.g. 48000 / 3 = 16000 Hz, 44100 / 3 = 14700 Hz)
+              int factor = (int)std::llround(inputSr / 14500.0);
+              decimFactor = juce::jlimit(1, 8, factor);
+              analysisSr = inputSr / (double)decimFactor;
+
               writePos.store(0, std::memory_order_release);
               lastAnalyzed.store(0, std::memory_order_release);
               pitchHistCount = 0; midiHistCount = 0; lastMidiLocal = -1;
@@ -388,12 +386,20 @@ jobs:
 
           void PitchDetector::feed(const float* s, int n) {
               if (!s || n <= 0) return;
+              // Box-average decimation by decimFactor to reduce aliasing before YIN
+              const int df = juce::jmax(1, decimFactor);
               const int64_t wp = writePos.load(std::memory_order_relaxed);
-              for (int i = 0; i < n; ++i) {
-                  const int64_t idx = (wp + (int64_t)i) % kRingSize;
-                  ring[(size_t)idx] = s[i];
+              int64_t outIdx = wp;
+              const float invDf = 1.0f / (float)df;
+              for (int i = 0; i + df <= n; i += df) {
+                  float acc = 0.0f;
+                  for (int k = 0; k < df; ++k) acc += s[i + k];
+                  ring[(size_t)(outIdx % kRingSize)] = acc * invDf;
+                  ++outIdx;
               }
-              writePos.store(wp + (int64_t)n, std::memory_order_release);
+              if (outIdx != wp) {
+                  writePos.store(outIdx, std::memory_order_release);
+              }
           }
 
           PitchDetector::Frame PitchDetector::latestFrame() const {
@@ -434,7 +440,14 @@ jobs:
                   const float threshold = voicedThreshold.load(std::memory_order_acquire);
 
                   const int half = (int)(kWindow / 2);
-                  for (int tau = 1; tau < half; ++tau) {
+                  const int maxTau = juce::jmin(half - 1, (int)(analysisSr / 65.0));
+                  const int minTau = juce::jmax(2, (int)(analysisSr / 1400.0));
+                  if (maxTau <= minTau + 2) {
+                      outVoiced.store(false, std::memory_order_release);
+                      continue;
+                  }
+
+                  for (int tau = 1; tau <= maxTau; ++tau) {
                       double s = 0.0;
                       for (int j = 0; j < half; ++j) {
                           double d = (double)buf[(size_t)j] - (double)buf[(size_t)(j + tau)];
@@ -444,14 +457,14 @@ jobs:
                   }
                   yin[0] = 0.0f; cmnd[0] = 1.0f;
                   double running = 0.0;
-                  for (int tau = 1; tau < half; ++tau) {
+                  for (int tau = 1; tau <= maxTau; ++tau) {
                       running += (double)yin[(size_t)tau];
                       cmnd[(size_t)tau] = running > 1e-9 ? (float)((double)yin[(size_t)tau] * (double)tau / running) : 1.0f;
                   }
                   int tauEst = -1;
-                  for (int tau = 2; tau < half - 1; ++tau) {
+                  for (int tau = minTau; tau < maxTau; ++tau) {
                       if (cmnd[(size_t)tau] < 0.15f) {
-                          while (tau + 1 < half && cmnd[(size_t)(tau + 1)] < cmnd[(size_t)tau]) ++tau;
+                          while (tau + 1 < maxTau && cmnd[(size_t)(tau + 1)] < cmnd[(size_t)tau]) ++tau;
                           tauEst = tau; break;
                       }
                   }
@@ -460,12 +473,12 @@ jobs:
                       continue;
                   }
                   float betterTau = (float)tauEst;
-                  if (tauEst > 0 && tauEst < half - 1) {
+                  if (tauEst > 0 && tauEst < maxTau) {
                       float s0 = cmnd[(size_t)(tauEst - 1)], s1 = cmnd[(size_t)tauEst], s2 = cmnd[(size_t)(tauEst + 1)];
                       float denom = 2.0f * (2.0f * s1 - s2 - s0);
                       if (std::abs(denom) > 1e-6f) betterTau = (float)tauEst + (s2 - s0) / denom;
                   }
-                  float freq = (float)(sr / (double)betterTau);
+                  float freq = (float)(analysisSr / (double)betterTau);
                   float conf = juce::jlimit(0.0f, 1.0f, 1.0f - cmnd[(size_t)tauEst]);
                   int midi = (int)std::round(69.0 + 12.0 * std::log2((double)freq / 440.0));
                   if (midi < 21 || midi > 108) {
@@ -512,7 +525,6 @@ jobs:
           float PitchDetector::midiToFreq(int midi) { return 440.0f * std::pow(2.0f, (float)(midi - 69) / 12.0f); }
           EOF
 
-          # ── NoteTracker (60 ms hold + ±1 semitone flicker filter + audio-time onset) ──
           cat > Source/NoteTracker.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
@@ -677,7 +689,6 @@ jobs:
           }
           EOF
 
-          # ── KeyEstimator (major + minor Krumhansl with reset) ──
           cat > Source/KeyEstimator.h << 'EOF'
           #pragma once
           class KeyEstimator {
@@ -743,7 +754,6 @@ jobs:
           }
           EOF
 
-          # ── TempoEstimator (from real onset times with reset) ──
           cat > Source/TempoEstimator.h << 'EOF'
           #pragma once
           #include <array>
@@ -798,7 +808,6 @@ jobs:
           }
           EOF
 
-          # ── ChordInference (UI thread only) ──
           cat > Source/ChordInference.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
@@ -873,13 +882,14 @@ jobs:
           }
           EOF
 
-          # ── SoundFontSynth (polyphony limit, pan conversion) ──
           cat > Source/SoundFontSynth.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
           struct tsf;
           class SoundFontSynth {
           public:
+              static constexpr int kMaxVoices = 64;
+
               SoundFontSynth();
               ~SoundFontSynth();
               void initialize(double sampleRate);
@@ -889,21 +899,31 @@ jobs:
               void setInstrument    (int channel, int programNumber);
               void setChannelVolume (int channel, float volume);
               void setChannelPan    (int channel, float panMinus1ToPlus1);
-              void render(float* left, float* right, int numSamples);
+              void renderSlice(float* left, float* right, int startSample, int numSamples);
               void prepareLimiterForBlock(int maxBlock);
           private:
-              void enforcePolyphony();
-              tsf* synth = nullptr;
+              static bool isReverbChannel(int ch) { return ch == 0 || ch == 2 || ch == 4; }
+              void enforcePolyphony(tsf* targetSynth, int maxVoices);
+              void recordVoice(int ch, int midi, bool reverbBus);
+              void removeVoice(int ch, int midi, bool reverbBus);
+
+              tsf* drySynth = nullptr;
+              tsf* wetSynth = nullptr;
               juce::HeapBlock<float> scratch;
+              juce::HeapBlock<float> wetLeft;
+              juce::HeapBlock<float> wetRight;
               int scratchSize = 0;
+              int wetBufSize = 0;
+
               juce::Reverb reverb;
+              juce::dsp::Compressor<float> compressor;
               juce::dsp::Limiter<float> limiter;
-              juce::AudioBuffer<float> limBuf;
+              juce::AudioBuffer<float> busBuf;
               double sr = 44100.0;
               int maxBlock = 512;
-              struct ActiveNote { int ch; int midi; };
-              static constexpr int kMaxPoly = 32;
-              ActiveNote active[kMaxPoly];
+
+              struct ActiveVoice { int ch; int midi; bool reverbBus; };
+              ActiveVoice active[kMaxVoices];
               int numActive = 0;
           };
           EOF
@@ -913,95 +933,221 @@ jobs:
           #include "tsf.h"
 
           SoundFontSynth::SoundFontSynth() {}
-          SoundFontSynth::~SoundFontSynth() { if (synth) tsf_close(synth); }
+          SoundFontSynth::~SoundFontSynth() {
+              if (wetSynth) tsf_close(wetSynth);
+              if (drySynth) tsf_close(drySynth);
+          }
 
           void SoundFontSynth::prepareLimiterForBlock(int maxBlockSamples) {
               maxBlock = juce::jmax(maxBlockSamples, 512);
-              limiter.prepare({ sr, (juce::uint32)maxBlock, 2 });
-              limBuf.setSize(2, maxBlock, false, false, true);
-              if (scratchSize < maxBlock * 2) { scratch.allocate((size_t)(maxBlock * 2), false); scratchSize = maxBlock * 2; }
+              juce::dsp::ProcessSpec spec { sr, (juce::uint32)maxBlock, 2 };
+              compressor.prepare(spec);
+              compressor.setThreshold(-14.0f);
+              compressor.setRatio(2.5f);
+              compressor.setAttack(15.0f);
+              compressor.setRelease(140.0f);
+
+              limiter.prepare(spec);
+              limiter.setThreshold(-1.0f);
+              limiter.setRelease(50.0f);
+
+              busBuf.setSize(2, maxBlock, false, false, true);
+              if (scratchSize < maxBlock * 2) {
+                  scratch.allocate((size_t)(maxBlock * 2), false);
+                  scratchSize = maxBlock * 2;
+              }
+              if (wetBufSize < maxBlock) {
+                  wetLeft.allocate((size_t)maxBlock, false);
+                  wetRight.allocate((size_t)maxBlock, false);
+                  wetBufSize = maxBlock;
+              }
           }
 
           void SoundFontSynth::initialize(double sampleRate) {
               sr = sampleRate;
-              if (synth) { tsf_close(synth); synth = nullptr; }
+              if (wetSynth) { tsf_close(wetSynth); wetSynth = nullptr; }
+              if (drySynth) { tsf_close(drySynth); drySynth = nullptr; }
+              numActive = 0;
               if (BinaryData::SoundFont_sf2Size == 0) return;
-              synth = tsf_load_memory(BinaryData::SoundFont_sf2, BinaryData::SoundFont_sf2Size);
-              if (!synth) return;
-              tsf_set_output(synth, TSF_STEREO_INTERLEAVED, (int)sr, 0);
-              for (int ch = 0; ch < 16; ++ch)
-                  tsf_channel_set_presetnumber(synth, ch, 0, ch == 9 ? 1 : 0);
-              for (int ch = 0; ch < 16; ++ch)
-                  tsf_channel_set_pan(synth, ch, 0.5f);
+
+              drySynth = tsf_load_memory(BinaryData::SoundFont_sf2, BinaryData::SoundFont_sf2Size);
+              if (!drySynth) return;
+              wetSynth = tsf_copy(drySynth);
+
+              tsf_set_max_voices(drySynth, kMaxVoices);
+              tsf_set_output(drySynth, TSF_STEREO_INTERLEAVED, (int)sr, 0);
+              if (wetSynth) {
+                  tsf_set_max_voices(wetSynth, kMaxVoices);
+                  tsf_set_output(wetSynth, TSF_STEREO_INTERLEAVED, (int)sr, 0);
+              }
+
+              for (int ch = 0; ch < 16; ++ch) {
+                  tsf_channel_set_presetnumber(drySynth, ch, 0, ch == 9 ? 1 : 0);
+                  tsf_channel_set_pan(drySynth, ch, 0.5f);
+                  if (wetSynth) {
+                      tsf_channel_set_presetnumber(wetSynth, ch, 0, ch == 9 ? 1 : 0);
+                      tsf_channel_set_pan(wetSynth, ch, 0.5f);
+                  }
+              }
+
               reverb.setSampleRate(sr);
               juce::Reverb::Parameters p;
-              p.roomSize = 0.5f; p.damping = 0.6f; p.wetLevel = 0.18f;
-              p.dryLevel = 0.82f; p.width = 0.8f; p.freezeMode = 0.0f;
+              p.roomSize = 0.55f;
+              p.damping = 0.55f;
+              p.wetLevel = 0.35f;
+              p.dryLevel = 0.85f;
+              p.width = 0.85f;
+              p.freezeMode = 0.0f;
               reverb.setParameters(p);
+
               prepareLimiterForBlock(juce::jmax(4096, maxBlock));
-              numActive = 0;
           }
 
-          void SoundFontSynth::enforcePolyphony() {
-              while (numActive > kMaxPoly) {
-                  int victim = 0;
-                  if (synth) tsf_channel_note_off(synth, active[victim].ch, active[victim].midi);
+          void SoundFontSynth::enforcePolyphony(tsf* targetSynth, int maxVoices) {
+              while (numActive > maxVoices) {
+                  int victim = -1;
+                  for (int i = 0; i < numActive; ++i) {
+                      bool onTarget = (isReverbChannel(active[i].ch) && targetSynth == wetSynth)
+                                   || (!isReverbChannel(active[i].ch) && targetSynth == drySynth);
+                      if (onTarget) { victim = i; break; }
+                  }
+                  if (victim < 0) victim = 0;
+                  if (targetSynth) tsf_channel_note_off(targetSynth, active[victim].ch, active[victim].midi);
                   for (int i = victim; i < numActive - 1; ++i) active[i] = active[i + 1];
                   --numActive;
               }
           }
 
-          void SoundFontSynth::noteOn(int ch, int m, float v) {
-              if (!synth) return;
-              bool found = false;
-              for (int i = 0; i < numActive; ++i)
-                  if (active[i].ch == ch && active[i].midi == m) { found = true; break; }
-              if (!found && numActive >= kMaxPoly) enforcePolyphony();
-              tsf_channel_note_on(synth, ch, m, v);
-              if (!found && numActive < kMaxPoly) active[numActive++] = { ch, m };
+          void SoundFontSynth::recordVoice(int ch, int midi, bool reverbBus) {
+              for (int i = 0; i < numActive; ++i) {
+                  if (active[i].ch == ch && active[i].midi == midi) return;
+              }
+              if (numActive >= kMaxVoices) {
+                  if (drySynth) tsf_channel_note_off(drySynth, active[0].ch, active[0].midi);
+                  if (wetSynth) tsf_channel_note_off(wetSynth, active[0].ch, active[0].midi);
+                  for (int i = 0; i < numActive - 1; ++i) active[i] = active[i + 1];
+                  --numActive;
+              }
+              active[numActive++] = { ch, midi, reverbBus };
           }
-          void SoundFontSynth::noteOff(int ch, int m) {
-              if (!synth) return;
-              tsf_channel_note_off(synth, ch, m);
+
+          void SoundFontSynth::removeVoice(int ch, int midi, bool /*reverbBus*/) {
               for (int i = 0; i < numActive; ) {
-                  if (active[i].ch == ch && active[i].midi == m) { active[i] = active[--numActive]; }
-                  else ++i;
+                  if (active[i].ch == ch && active[i].midi == midi) {
+                      active[i] = active[--numActive];
+                  } else {
+                      ++i;
+                  }
               }
           }
+
+          void SoundFontSynth::noteOn(int ch, int m, float v) {
+              if (!drySynth) return;
+              const bool useWet = isReverbChannel(ch) && (wetSynth != nullptr);
+              tsf* target = useWet ? wetSynth : drySynth;
+              enforcePolyphony(target, kMaxVoices - 1);
+              tsf_channel_note_on(target, ch, m, v);
+              recordVoice(ch, m, useWet);
+          }
+
+          void SoundFontSynth::noteOff(int ch, int m) {
+              if (!drySynth) return;
+              const bool useWet = isReverbChannel(ch) && (wetSynth != nullptr);
+              tsf* target = useWet ? wetSynth : drySynth;
+              tsf_channel_note_off(target, ch, m);
+              removeVoice(ch, m, useWet);
+          }
+
           void SoundFontSynth::allNotesOff() {
-              if (synth) tsf_note_off_all(synth);
+              if (drySynth) tsf_note_off_all(drySynth);
+              if (wetSynth) tsf_note_off_all(wetSynth);
               numActive = 0;
           }
-          void SoundFontSynth::setInstrument(int ch, int p) { if (synth) tsf_channel_set_presetnumber(synth, ch, p, ch == 9 ? 1 : 0); }
-          void SoundFontSynth::setChannelVolume(int ch, float v) { if (synth) tsf_channel_set_volume(synth, ch, juce::jlimit(0.0f, 1.0f, v)); }
-          void SoundFontSynth::setChannelPan(int ch, float pan) {
-              if (!synth) return;
-              float sfPan = juce::jlimit(0.0f, 1.0f, (pan + 1.0f) * 0.5f);
-              tsf_channel_set_pan(synth, ch, sfPan);
+
+          void SoundFontSynth::setInstrument(int ch, int p) {
+              if (drySynth) tsf_channel_set_presetnumber(drySynth, ch, p, ch == 9 ? 1 : 0);
+              if (wetSynth) tsf_channel_set_presetnumber(wetSynth, ch, p, ch == 9 ? 1 : 0);
           }
-          void SoundFontSynth::render(float* left, float* right, int n) {
-              if (!synth) { juce::FloatVectorOperations::clear(left, n); if (right) juce::FloatVectorOperations::clear(right, n); return; }
-              if (scratchSize < n * 2) { scratch.allocate((size_t)(n * 2), false); scratchSize = n * 2; }
-              if (limBuf.getNumSamples() < n) limBuf.setSize(2, n, false, false, true);
-              tsf_render_float(synth, scratch.get(), n, 0);
-              for (int i = 0; i < n; ++i) { left[i] = scratch[i * 2]; if (right) right[i] = scratch[i * 2 + 1]; }
-              if (right) reverb.processStereo(left, right, n);
-              juce::FloatVectorOperations::copy(limBuf.getWritePointer(0), left, n);
-              if (right) juce::FloatVectorOperations::copy(limBuf.getWritePointer(1), right, n);
-              juce::dsp::AudioBlock<float> blk(limBuf.getArrayOfWritePointers(), 2, (size_t)n);
+
+          void SoundFontSynth::setChannelVolume(int ch, float v) {
+              const float clamped = juce::jlimit(0.0f, 1.0f, v);
+              if (drySynth) tsf_channel_set_volume(drySynth, ch, clamped);
+              if (wetSynth) tsf_channel_set_volume(wetSynth, ch, clamped);
+          }
+
+          void SoundFontSynth::setChannelPan(int ch, float pan) {
+              const float sfPan = juce::jlimit(0.0f, 1.0f, (pan + 1.0f) * 0.5f);
+              if (drySynth) tsf_channel_set_pan(drySynth, ch, sfPan);
+              if (wetSynth) tsf_channel_set_pan(wetSynth, ch, sfPan);
+          }
+
+          void SoundFontSynth::renderSlice(float* left, float* right, int startSample, int n) {
+              if (!left || n <= 0) return;
+              float* lPtr = left + startSample;
+              float* rPtr = right ? (right + startSample) : nullptr;
+              if (!drySynth) {
+                  juce::FloatVectorOperations::clear(lPtr, n);
+                  if (rPtr) juce::FloatVectorOperations::clear(rPtr, n);
+                  return;
+              }
+              if (scratchSize < n * 2) {
+                  scratch.allocate((size_t)(n * 2), false);
+                  scratchSize = n * 2;
+              }
+              if (wetBufSize < n) {
+                  wetLeft.allocate((size_t)n, false);
+                  wetRight.allocate((size_t)n, false);
+                  wetBufSize = n;
+              }
+              if (busBuf.getNumSamples() < n) {
+                  busBuf.setSize(2, n, false, false, true);
+              }
+
+              tsf_render_float(drySynth, scratch.get(), n, 0);
+              for (int i = 0; i < n; ++i) {
+                  lPtr[i] = scratch[i * 2];
+                  if (rPtr) rPtr[i] = scratch[i * 2 + 1];
+              }
+
+              if (wetSynth) {
+                  tsf_render_float(wetSynth, scratch.get(), n, 0);
+                  for (int i = 0; i < n; ++i) {
+                      wetLeft[i] = scratch[i * 2];
+                      wetRight[i] = scratch[i * 2 + 1];
+                  }
+                  if (rPtr) {
+                      reverb.processStereo(wetLeft.get(), wetRight.get(), n);
+                      juce::FloatVectorOperations::add(lPtr, wetLeft.get(), n);
+                      juce::FloatVectorOperations::add(rPtr, wetRight.get(), n);
+                  } else {
+                      reverb.processMono(wetLeft.get(), n);
+                      juce::FloatVectorOperations::add(lPtr, wetLeft.get(), n);
+                  }
+              }
+
+              juce::FloatVectorOperations::copy(busBuf.getWritePointer(0), lPtr, n);
+              if (rPtr) {
+                  juce::FloatVectorOperations::copy(busBuf.getWritePointer(1), rPtr, n);
+              } else {
+                  juce::FloatVectorOperations::copy(busBuf.getWritePointer(1), lPtr, n);
+              }
+
+              juce::dsp::AudioBlock<float> blk(busBuf.getArrayOfWritePointers(), 2, (size_t)n);
               juce::dsp::ProcessContextReplacing<float> ctx(blk);
+              compressor.process(ctx);
               limiter.process(ctx);
-              juce::FloatVectorOperations::copy(left, limBuf.getReadPointer(0), n);
-              if (right) juce::FloatVectorOperations::copy(right, limBuf.getReadPointer(1), n);
+
+              juce::FloatVectorOperations::copy(lPtr, busBuf.getReadPointer(0), n);
+              if (rPtr) juce::FloatVectorOperations::copy(rPtr, busBuf.getReadPointer(1), n);
           }
           EOF
 
-          # ── Scheduler (consolidated pending-plan helper, bar-boundary apply, clean Start reset) ──
           cat > Source/Scheduler.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
           #include <array>
           #include <atomic>
+          #include <random>
 
           class SoundFontSynth;
 
@@ -1040,8 +1186,10 @@ jobs:
               void setSampleRate(double sr)  { sampleRate = sr; }
               void setTempo(double bpm)      { tempo.store(bpm); }
               double getTempo() const        { return tempo.load(); }
+              void setFollowServerTempo(bool follow) { followServerTempo.store(follow, std::memory_order_release); }
+              bool getFollowServerTempo() const { return followServerTempo.load(std::memory_order_acquire); }
               double getBeatsPerBar() const  { return beatsPerBar; }
-              bool   isRunning() const       { return running.load(); }
+              bool   isRunning() const       { return running.load(std::memory_order_acquire); }
               bool   isCountingIn() const    { return countInRemaining > 0.0; }
               int    getCurrentBar() const   { return currentBar.load(); }
               double getBeatPosition() const { return beatPosition.load(); }
@@ -1052,10 +1200,12 @@ jobs:
               void queueSliderChange(int channel, float value);
               InstrumentSnapshot getInstrumentSnapshot() const;
               void processBlock(int numSamples, SoundFontSynth& synth);
+              void processBlockStereo(float* left, float* right, int numSamples, SoundFontSynth& synth);
 
               struct SliderMsg { int channel; float value; };
 
           private:
+              void applyStartRequestOnAudioThread(SoundFontSynth& synth);
               void seedDefaultGroove();
               void applyPlanAtBar(const RawPlan& plan, SoundFontSynth& synth);
               void applyPendingPlansUpToBar(int bar, SoundFontSynth& synth);
@@ -1066,16 +1216,22 @@ jobs:
               void applyVolumeForChannel(int ch, SoundFontSynth& synth);
               void clearBarSlots();
               void resetSnapshot();
+              float humanizeVelocity(float baseVel);
+              void triggerNoteOnClean(int ch, int midi, float vel, double offBeat, SoundFontSynth& synth);
+              void scheduleNoteOff(double offBeat, int ch, int midi, SoundFontSynth& synth);
+              void fireDueNoteOffs(double upToBeat, SoundFontSynth& synth);
 
-              static constexpr int kPlanRingSize = 8;
+              static constexpr int kPlanRingSize = 16;
               static constexpr int kMaxBarSlots  = 16;
-              static constexpr int kMaxOffs      = 64;
+              static constexpr int kMaxOffs      = 256;
               static constexpr int kMaxSliderMsgs = 64;
               static constexpr int kClickMidi = 76;
 
               double sampleRate = 44100.0;
               double beatsPerBar = 4.0;
+              std::atomic<bool>   startRequested { false };
               std::atomic<bool>   running { false };
+              std::atomic<bool>   followServerTempo { false };
               std::atomic<double> tempo { 120.0 };
               std::atomic<double> beatPosition { 0.0 };
               std::atomic<int>    currentBar { 0 };
@@ -1120,6 +1276,8 @@ jobs:
 
               InstrumentSnapshot instSnap[2];
               std::atomic<int> instSnapIdx { 0 };
+
+              std::minstd_rand rng { 0xA11EBu };
           };
           EOF
 
@@ -1128,6 +1286,7 @@ jobs:
           #include "SoundFontSynth.h"
           #include <algorithm>
           #include <climits>
+          #include <cmath>
 
           Scheduler::Scheduler() {
               for (int i = 0; i < 16; ++i) {
@@ -1178,7 +1337,55 @@ jobs:
                   [](const ScheduledEvent& a, const ScheduledEvent& b) { return a.beat < b.beat; });
           }
 
+          float Scheduler::humanizeVelocity(float baseVel) {
+              float jitter = (((float)(rng() & 0xFFFFu) / 65535.0f) * 2.0f - 1.0f) * 0.06f;
+              return juce::jlimit(0.05f, 1.0f, baseVel * (1.0f + jitter));
+          }
+
+          void Scheduler::triggerNoteOnClean(int ch, int midi, float vel, double offBeat, SoundFontSynth& synth) {
+              for (int i = 0; i < numOffs; ) {
+                  if (offs[i].ch == ch && offs[i].midi == midi) {
+                      offs[i] = offs[--numOffs];
+                  } else {
+                      ++i;
+                  }
+              }
+              synth.noteOff(ch, midi);
+              synth.noteOn(ch, midi, vel);
+              scheduleNoteOff(offBeat, ch, midi, synth);
+          }
+
+          void Scheduler::scheduleNoteOff(double offBeat, int ch, int midi, SoundFontSynth& synth) {
+              if (numOffs >= kMaxOffs) {
+                  synth.noteOff(offs[0].ch, offs[0].midi);
+                  for (int i = 0; i < numOffs - 1; ++i) offs[i] = offs[i + 1];
+                  --numOffs;
+              }
+              offs[numOffs++] = { offBeat, ch, midi };
+          }
+
+          void Scheduler::fireDueNoteOffs(double upToBeat, SoundFontSynth& synth) {
+              for (int i = 0; i < numOffs; ) {
+                  if (offs[i].beat <= upToBeat + 1e-9) {
+                      synth.noteOff(offs[i].ch, offs[i].midi);
+                      offs[i] = offs[--numOffs];
+                  } else {
+                      ++i;
+                  }
+              }
+          }
+
           void Scheduler::start() {
+              startRequested.store(true, std::memory_order_release);
+          }
+
+          void Scheduler::stop() {
+              startRequested.store(false, std::memory_order_release);
+              running.store(false, std::memory_order_release);
+          }
+
+          void Scheduler::applyStartRequestOnAudioThread(SoundFontSynth& synth) {
+              synth.allNotesOff();
               beatPosition.store(0.0);
               currentBar.store(0);
               countInRemaining = beatsPerBar;
@@ -1198,17 +1405,18 @@ jobs:
                   serverVolumeStep[i] = 0.0f;
                   fadeRemainingBeats[i] = 0.0f;
               }
-              running.store(true);
+              running.store(true, std::memory_order_release);
           }
-          void Scheduler::stop() { running.store(false); }
 
           void Scheduler::queuePlan(const RawPlan& plan) {
+              if (plan.bar < 0) return;
               int w = planRingWrite.load(std::memory_order_relaxed);
               int r = planRingRead.load(std::memory_order_acquire);
               if (w - r >= kPlanRingSize - 1) return;
               planRing[w % kPlanRingSize] = plan;
               planRingWrite.store(w + 1, std::memory_order_release);
           }
+
           void Scheduler::queueSliderChange(int ch, float v) {
               if (ch < 0 || ch >= 16) return;
               int s1, n1, s2, n2;
@@ -1225,10 +1433,10 @@ jobs:
           void Scheduler::drainPlanRing() {
               int w = planRingWrite.load(std::memory_order_acquire);
               int r = planRingRead.load(std::memory_order_relaxed);
-              int curBar = currentBar.load(std::memory_order_acquire);
+              int curBar = isCountingIn() ? -1 : currentBar.load(std::memory_order_acquire);
               while (r < w) {
                   const RawPlan& p = planRing[r % kPlanRingSize];
-                  if (p.bar > curBar && numPending < kMaxBarSlots) {
+                  if (p.bar >= 0 && (isCountingIn() || p.bar > curBar) && numPending < kMaxBarSlots) {
                       int existing = -1;
                       for (int i = 0; i < numPending; ++i) {
                           if (pendingPlans[i].bar == p.bar) { existing = i; break; }
@@ -1317,7 +1525,9 @@ jobs:
                   }
               }
               instSnapIdx.store(next, std::memory_order_release);
-              if (plan.tempo > 1.0) tempo.store(plan.tempo);
+              if (followServerTempo.load(std::memory_order_acquire) && plan.tempo > 1.0) {
+                  tempo.store(plan.tempo);
+              }
           }
 
           void Scheduler::applyPendingPlansUpToBar(int bar, SoundFontSynth& synth) {
@@ -1354,69 +1564,132 @@ jobs:
           }
 
           void Scheduler::processBlock(int numSamples, SoundFontSynth& synth) {
-              if (!running.load()) return;
+              processBlockStereo(nullptr, nullptr, numSamples, synth);
+          }
+
+          void Scheduler::processBlockStereo(float* left, float* right, int numSamples, SoundFontSynth& synth) {
+              if (startRequested.exchange(false, std::memory_order_acq_rel)) {
+                  applyStartRequestOnAudioThread(synth);
+              }
+
+              if (!running.load(std::memory_order_acquire)) {
+                  if (left) synth.renderSlice(left, right, 0, numSamples);
+                  return;
+              }
               drainPlanRing();
               drainSliderFifo();
+
               const double bpm = tempo.load();
-              const double beatsPerSample = bpm / 60.0 / sampleRate;
+              const double beatsPerSample = bpm / 60.0 / juce::jmax(1.0, sampleRate);
+              const double samplesPerBeat = 1.0 / juce::jmax(1e-9, beatsPerSample);
               const double beatsThisBlock = beatsPerSample * numSamples;
               advanceFades(beatsThisBlock);
               for (int ch = 0; ch < 16; ++ch) applyVolumeForChannel(ch, synth);
 
-              for (int s = 0; s < numSamples; ++s) {
+              int cursorSample = 0;
+              while (cursorSample < numSamples) {
+                  const int remainingSamples = numSamples - cursorSample;
+
                   if (countInRemaining > 0.0) {
-                      countInRemaining -= beatsPerSample;
-                      countInBeatsElapsed += beatsPerSample;
-                      int curIdx = (int)(beatsPerBar - countInRemaining + 1e-9);
-                      if (curIdx > lastCountInIdx && curIdx < (int)beatsPerBar) {
-                          lastCountInIdx = curIdx;
-                          synth.noteOn(9, kClickMidi, 1.0f);
-                          if (numOffs < kMaxOffs) offs[numOffs++] = { countInBeatsElapsed + 0.1, 9, kClickMidi };
+                      int nextClickBeatIdx = lastCountInIdx + 1;
+                      if (nextClickBeatIdx < (int)beatsPerBar && countInBeatsElapsed >= (double)nextClickBeatIdx - 1e-9) {
+                          lastCountInIdx = nextClickBeatIdx;
+                          triggerNoteOnClean(9, kClickMidi, humanizeVelocity(0.95f),
+                                             countInBeatsElapsed + 0.08, synth);
                       }
-                      for (int i = 0; i < numOffs; ) {
-                          if (offs[i].beat <= countInBeatsElapsed) { synth.noteOff(offs[i].ch, offs[i].midi); offs[i] = offs[--numOffs]; }
-                          else ++i;
-                      }
-                      if (countInRemaining <= 0.0) {
+                      fireDueNoteOffs(countInBeatsElapsed, synth);
+
+                      if (countInRemaining <= 1e-9) {
                           countInRemaining = 0.0;
                           beatPosition.store(0.0);
                           currentBar.store(0);
                           numOffs = 0;
                           loadBarEventsFor(0, synth);
+                          continue;
                       }
-                      continue;
-                  }
 
-                  double curBeat = beatPosition.load();
-                  double nextBeat = curBeat + beatsPerSample;
-
-                  for (int i = 0; i < numOffs; ) {
-                      if (offs[i].beat <= nextBeat) { synth.noteOff(offs[i].ch, offs[i].midi); offs[i] = offs[--numOffs]; }
-                      else ++i;
-                  }
-
-                  int newBar = (int)(nextBeat / beatsPerBar);
-                  if (newBar != currentBar.load()) {
-                      currentBar.store(newBar);
-                      loadBarEventsFor(newBar, synth);
-                  }
-
-                  while (eventCursor < numActiveEvents) {
-                      const auto& e = activeEvents[eventCursor];
-                      double triggerBeat = currentBar.load() * beatsPerBar + e.beat;
-                      if (triggerBeat > nextBeat) break;
-                      if (triggerBeat >= curBeat) {
-                          synth.noteOn(e.channel, e.midi, e.velocity);
-                          if (numOffs < kMaxOffs) offs[numOffs++] = { triggerBeat + e.duration, e.channel, e.midi };
+                      double beatsUntilNextEvent = countInRemaining;
+                      int upcomingClickIdx = lastCountInIdx + 1;
+                      if (upcomingClickIdx < (int)beatsPerBar) {
+                          double dClick = (double)upcomingClickIdx - countInBeatsElapsed;
+                          if (dClick > 1e-9 && dClick < beatsUntilNextEvent)
+                              beatsUntilNextEvent = dClick;
                       }
-                      ++eventCursor;
+                      for (int i = 0; i < numOffs; ++i) {
+                          double dOff = offs[i].beat - countInBeatsElapsed;
+                          if (dOff > 1e-9 && dOff < beatsUntilNextEvent)
+                              beatsUntilNextEvent = dOff;
+                      }
+
+                      int sliceLen = remainingSamples;
+                      if (beatsUntilNextEvent < beatsThisBlock) {
+                          sliceLen = juce::jlimit(1, remainingSamples, (int)std::floor(beatsUntilNextEvent * samplesPerBeat));
+                          if (sliceLen <= 0) sliceLen = 1;
+                      }
+                      double sliceBeats = juce::jmin(countInRemaining, (double)sliceLen * beatsPerSample);
+
+                      if (left) synth.renderSlice(left, right, cursorSample, sliceLen);
+                      cursorSample += sliceLen;
+                      countInRemaining = juce::jmax(0.0, countInRemaining - sliceBeats);
+                      countInBeatsElapsed += sliceBeats;
+                  } else {
+                      double curBeat = beatPosition.load();
+                      int curBarVal = currentBar.load();
+
+                      int barAtCurBeat = (int)std::floor((curBeat + 1e-9) / beatsPerBar);
+                      if (barAtCurBeat != curBarVal) {
+                          currentBar.store(barAtCurBeat);
+                          curBarVal = barAtCurBeat;
+                          loadBarEventsFor(curBarVal, synth);
+                      }
+
+                      fireDueNoteOffs(curBeat, synth);
+
+                      while (eventCursor < numActiveEvents) {
+                          const auto& e = activeEvents[eventCursor];
+                          double triggerBeat = (double)curBarVal * beatsPerBar + e.beat;
+                          if (triggerBeat <= curBeat + 1e-9) {
+                              triggerNoteOnClean(e.channel, e.midi, humanizeVelocity(e.velocity),
+                                                 triggerBeat + juce::jmax(0.05, e.duration), synth);
+                              ++eventCursor;
+                          } else {
+                              break;
+                          }
+                      }
+
+                      double nextDueBeat = curBeat + (double)remainingSamples * beatsPerSample;
+                      double nextBarBeat = (double)(curBarVal + 1) * beatsPerBar;
+                      if (nextBarBeat > curBeat + 1e-9 && nextBarBeat < nextDueBeat) {
+                          nextDueBeat = nextBarBeat;
+                      }
+                      if (eventCursor < numActiveEvents) {
+                          double trigBeat = (double)curBarVal * beatsPerBar + activeEvents[eventCursor].beat;
+                          if (trigBeat > curBeat + 1e-9 && trigBeat < nextDueBeat) {
+                              nextDueBeat = trigBeat;
+                          }
+                      }
+                      for (int i = 0; i < numOffs; ++i) {
+                          if (offs[i].beat > curBeat + 1e-9 && offs[i].beat < nextDueBeat) {
+                              nextDueBeat = offs[i].beat;
+                          }
+                      }
+
+                      double deltaBeats = juce::jmax(0.0, nextDueBeat - curBeat);
+                      int sliceLen = remainingSamples;
+                      if (deltaBeats * samplesPerBeat < (double)remainingSamples) {
+                          sliceLen = juce::jlimit(1, remainingSamples, (int)std::floor(deltaBeats * samplesPerBeat));
+                      }
+                      double actualDeltaBeats = (double)sliceLen * beatsPerSample;
+                      double nextBeat = curBeat + actualDeltaBeats;
+
+                      if (left) synth.renderSlice(left, right, cursorSample, sliceLen);
+                      cursorSample += sliceLen;
+                      beatPosition.store(nextBeat);
                   }
-                  beatPosition.store(nextBeat);
               }
           }
           EOF
 
-          # ── Arranger (explicit field-existence checks and defaults for missing mixer/plan fields) ──
           cat > Source/Arranger.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
@@ -1555,7 +1828,7 @@ jobs:
           }
           EOF
 
-          # ── MainComponent (Speaker mode, Mic sensitivity + meter, Start resets estimators, StringArray) ──
+          # ── MainComponent: create/recreate detector on UI thread after device opens; display detector SR ──
           cat > Source/MainComponent.h << 'EOF'
           #pragma once
           #include <JuceHeader.h>
@@ -1568,6 +1841,7 @@ jobs:
           #include "Arranger.h"
           #include "SoundFontSynth.h"
           #include <atomic>
+          #include <memory>
 
           class MainComponent : public juce::Component, public juce::AudioIODeviceCallback, private juce::Timer {
           public:
@@ -1591,9 +1865,13 @@ jobs:
               void resetMixerSliders();
               void rebuildMixerFromSnapshot(const InstrumentSnapshot& snap);
               void syncEffectiveThresholdToDetector();
+              void createDetectorForSampleRateOnUiThread(double sr);
+              void destroyDetectorOnUiThread();
+              void scheduleDetectorRecreateOnUiThread(double sr);
 
               juce::AudioDeviceManager deviceManager;
-              std::unique_ptr<PitchDetector> pitchDetector;
+              std::atomic<PitchDetector*> activeDetector { nullptr };
+              std::unique_ptr<PitchDetector> ownedDetector;
               NoteTracker   noteTracker;
               Scheduler     scheduler;
               ChordInference chordInference;
@@ -1602,14 +1880,18 @@ jobs:
               SoundFontSynth synth;
               std::unique_ptr<Arranger> arranger;
 
+              double micLevelNormalized = 0.0;
+
               juce::Label  noteLabel, chordLabel, stateLabel, keyLabel, tempoLabel,
-                           instrumentsLabel, speakerHintLabel, rttLabel, micSensitivityLabel;
+                           instrumentsLabel, speakerHintLabel, rttLabel, latencyLabel,
+                           micSensitivityLabel, styleTitleLabel;
               juce::TextButton startButton { "Start" }, settingsButton { "Audio" };
               juce::ToggleButton speakerModeToggle { "Speaker mode" };
+              juce::ToggleButton followTempoToggle { "Follow singer tempo" };
+              juce::ComboBox styleComboBox;
               juce::Slider tempoSlider;
               juce::Slider micSensitivitySlider;
               juce::ProgressBar micLevelMeter;
-              double micLevelNormalized = 0.0;
               juce::OwnedArray<juce::Slider> channelSliders;
               juce::OwnedArray<juce::Label>  channelLabels;
               int channelIds[16];
@@ -1619,7 +1901,11 @@ jobs:
               std::atomic<float> currentEnergy { 0.0f };
               std::atomic<float> micThresholdSetting { kDefaultMicThreshold };
               std::atomic<bool>  speakerModeOn { false };
+              std::atomic<bool>  audioSessionActive { false };
               std::atomic<double> currentSampleRate { 44100.0 };
+              std::atomic<double> detectorSampleRate { 44100.0 };
+              std::atomic<int>   currentBufferSize { 512 };
+              std::atomic<float> measuredOutputDelayMs { 0.0f };
               std::atomic<float> userTempoBpm { 120.0f };
               std::atomic<float> userTempoConf { 0.0f };
               std::atomic<int>   userKeyPc { 0 };
@@ -1629,6 +1915,7 @@ jobs:
               std::vector<NoteEventRecord> pendingNotesForSend;
               double lastSendMs = 0.0;
               int64_t nextPingMs = 0;
+              juce::WeakReference<MainComponent> safeThis { this };
           };
           EOF
 
@@ -1637,7 +1924,7 @@ jobs:
           #include "GMNames.h"
           #include <cmath>
 
-          static void styleLabel(juce::Label& l, float size, juce::Colour c) {
+          static void applyLabelStyle(juce::Label& l, float size, juce::Colour c) {
               l.setFont(juce::Font(juce::FontOptions(size)));
               l.setColour(juce::Label::textColourId, c);
               l.setJustificationType(juce::Justification::centred);
@@ -1646,25 +1933,30 @@ jobs:
           MainComponent::MainComponent() : micLevelMeter(micLevelNormalized) {
               for (int i = 0; i < 16; ++i) channelIds[i] = -1;
 
-              styleLabel(stateLabel, 20.0f, juce::Colours::cyan);
-              styleLabel(noteLabel,  42.0f, juce::Colours::white);
-              styleLabel(chordLabel, 28.0f, juce::Colour::fromRGB(0,255,200));
-              styleLabel(keyLabel,   18.0f, juce::Colour::fromRGB(180,220,255));
-              styleLabel(tempoLabel, 18.0f, juce::Colour::fromRGB(180,220,255));
-              styleLabel(instrumentsLabel, 13.0f, juce::Colour::fromRGB(200,200,200));
-              styleLabel(speakerHintLabel, 13.0f, juce::Colours::orange);
-              styleLabel(rttLabel, 13.0f, juce::Colours::grey);
-              styleLabel(micSensitivityLabel, 13.0f, juce::Colours::lightgrey);
+              applyLabelStyle(stateLabel, 20.0f, juce::Colours::cyan);
+              applyLabelStyle(noteLabel,  42.0f, juce::Colours::white);
+              applyLabelStyle(chordLabel, 28.0f, juce::Colour::fromRGB(0,255,200));
+              applyLabelStyle(keyLabel,   18.0f, juce::Colour::fromRGB(180,220,255));
+              applyLabelStyle(tempoLabel, 18.0f, juce::Colour::fromRGB(180,220,255));
+              applyLabelStyle(instrumentsLabel, 13.0f, juce::Colour::fromRGB(200,200,200));
+              applyLabelStyle(speakerHintLabel, 13.0f, juce::Colours::orange);
+              applyLabelStyle(rttLabel, 13.0f, juce::Colours::grey);
+              applyLabelStyle(latencyLabel, 12.0f, juce::Colour::fromRGB(160, 220, 190));
+              applyLabelStyle(micSensitivityLabel, 13.0f, juce::Colours::lightgrey);
+              applyLabelStyle(styleTitleLabel, 13.0f, juce::Colours::lightgrey);
 
               speakerHintLabel.setText("Speaker mode off (raises threshold when on)", juce::dontSendNotification);
               rttLabel.setText("RTT: --", juce::dontSendNotification);
+              latencyLabel.setText("Latency: buf -- | out -- ms | det -- Hz", juce::dontSendNotification);
               keyLabel.setText("Key: - (0%)", juce::dontSendNotification);
               tempoLabel.setText("120 BPM", juce::dontSendNotification);
               instrumentsLabel.setText("Instruments: -", juce::dontSendNotification);
               micSensitivityLabel.setText("Mic sensitivity", juce::dontSendNotification);
+              styleTitleLabel.setText("Style", juce::dontSendNotification);
 
               for (auto* l : { &stateLabel, &noteLabel, &chordLabel, &keyLabel, &tempoLabel,
-                               &instrumentsLabel, &speakerHintLabel, &rttLabel, &micSensitivityLabel })
+                               &instrumentsLabel, &speakerHintLabel, &rttLabel, &latencyLabel,
+                               &micSensitivityLabel, &styleTitleLabel })
                   addAndMakeVisible(l);
 
               startButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(0,100,80));
@@ -1685,6 +1977,27 @@ jobs:
               };
               addAndMakeVisible(speakerModeToggle);
 
+              followTempoToggle.setToggleState(false, juce::dontSendNotification);
+              followTempoToggle.setColour(juce::ToggleButton::textColourId, juce::Colours::white);
+              followTempoToggle.onClick = [this] {
+                  const bool follow = followTempoToggle.getToggleState();
+                  scheduler.setFollowServerTempo(follow);
+                  if (!follow) {
+                      scheduler.setTempo(tempoSlider.getValue());
+                  }
+              };
+              addAndMakeVisible(followTempoToggle);
+
+              styleComboBox.addItem("Auto", 1);
+              styleComboBox.addItem("pop", 2);
+              styleComboBox.addItem("ballad", 3);
+              styleComboBox.addItem("dance", 4);
+              styleComboBox.addItem("rock", 5);
+              styleComboBox.addItem("jazz", 6);
+              styleComboBox.addItem("funk", 7);
+              styleComboBox.setSelectedId(1, juce::dontSendNotification);
+              addAndMakeVisible(styleComboBox);
+
               micSensitivitySlider.setRange(0.002, 0.120, 0.001);
               micSensitivitySlider.setValue((double)kDefaultMicThreshold, juce::dontSendNotification);
               micSensitivitySlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 64, 22);
@@ -1701,7 +2014,11 @@ jobs:
               tempoSlider.setRange(60.0, 200.0, 1.0);
               tempoSlider.setValue(120.0);
               tempoSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 22);
-              tempoSlider.onValueChange = [this] { scheduler.setTempo(tempoSlider.getValue()); };
+              tempoSlider.onValueChange = [this] {
+                  if (!scheduler.getFollowServerTempo()) {
+                      scheduler.setTempo(tempoSlider.getValue());
+                  }
+              };
               addAndMakeVisible(tempoSlider);
 
               startButton.onClick = [this] {
@@ -1720,18 +2037,51 @@ jobs:
                   }
               };
               settingsButton.onClick = [this] { showAudioSettings(); };
-              setSize(720, 840);
+              setSize(720, 900);
               startTimerHz(20);
           }
 
-          MainComponent::~MainComponent() { stopTimer(); stopAudio(); }
+          MainComponent::~MainComponent() {
+              stopTimer();
+              stopAudio();
+              destroyDetectorOnUiThread();
+          }
+
+          void MainComponent::createDetectorForSampleRateOnUiThread(double sr) {
+              const double validSr = juce::jmax(8000.0, sr);
+              activeDetector.store(nullptr, std::memory_order_release);
+              auto nextDet = std::make_unique<PitchDetector>();
+              nextDet->prepare(validSr);
+              PitchDetector* raw = nextDet.get();
+              ownedDetector = std::move(nextDet);
+              detectorSampleRate.store(validSr, std::memory_order_release);
+              activeDetector.store(raw, std::memory_order_release);
+              syncEffectiveThresholdToDetector();
+          }
+
+          void MainComponent::destroyDetectorOnUiThread() {
+              activeDetector.store(nullptr, std::memory_order_release);
+              ownedDetector.reset();
+          }
+
+          void MainComponent::scheduleDetectorRecreateOnUiThread(double sr) {
+              juce::WeakReference<MainComponent> weakRef = safeThis;
+              juce::MessageManager::callAsync([weakRef, sr]() {
+                  if (weakRef == nullptr) return;
+                  if (!weakRef->audioSessionActive.load(std::memory_order_acquire)) return;
+                  PitchDetector* current = weakRef->activeDetector.load(std::memory_order_acquire);
+                  if (current != nullptr && std::abs(current->getInputSampleRate() - sr) < 0.5) return;
+                  weakRef->createDetectorForSampleRateOnUiThread(sr);
+              });
+          }
 
           void MainComponent::syncEffectiveThresholdToDetector() {
               const float baseThr = micThresholdSetting.load(std::memory_order_acquire);
               const float effThr = speakerModeOn.load(std::memory_order_acquire)
                   ? juce::jmax(baseThr, kSpeakerModeThresholdFloor)
                   : baseThr;
-              if (pitchDetector) pitchDetector->setVoicedThreshold(effThr);
+              PitchDetector* det = activeDetector.load(std::memory_order_acquire);
+              if (det) det->setVoicedThreshold(effThr);
           }
 
           void MainComponent::showAudioSettings() {
@@ -1770,54 +2120,89 @@ jobs:
 
               auto err = deviceManager.initialiseWithDefaultDevices(1, 2);
               if (err.isNotEmpty()) { stateLabel.setText("AUDIO ERROR: " + err, juce::dontSendNotification); return; }
+
+              audioSessionActive.store(true, std::memory_order_release);
+
+              // Read the actual opened device sample rate after initialisation
+              double openedSr = currentSampleRate.load(std::memory_order_acquire);
+              if (auto* dev = deviceManager.getCurrentAudioDevice()) {
+                  const double devSr = dev->getCurrentSampleRate();
+                  if (devSr > 1000.0) openedSr = devSr;
+              }
+              createDetectorForSampleRateOnUiThread(openedSr);
+
+              scheduler.setFollowServerTempo(followTempoToggle.getToggleState());
+              if (!followTempoToggle.getToggleState()) {
+                  scheduler.setTempo(tempoSlider.getValue());
+              }
+              scheduler.start();
               deviceManager.addAudioCallback(this);
               arranger = std::make_unique<Arranger>();
               arranger->start();
-              scheduler.start();
               startButton.setButtonText("Stop");
               stateLabel.setText("CONNECTING...", juce::dontSendNotification);
           }
 
           void MainComponent::stopAudio() {
+              audioSessionActive.store(false, std::memory_order_release);
               if (arranger) { arranger->stop(); arranger.reset(); }
               if (deviceManager.getCurrentAudioDevice()) {
                   deviceManager.removeAudioCallback(this);
                   deviceManager.closeAudioDevice();
               }
               scheduler.stop();
+              destroyDetectorOnUiThread();
               synth.allNotesOff();
           }
 
           void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* d) {
-              const double sr = d->getCurrentSampleRate();
-              currentSampleRate.store(sr);
-              pitchDetector = std::make_unique<PitchDetector>();
-              pitchDetector->prepare(sr);
-              syncEffectiveThresholdToDetector();
+              const double sr = d ? d->getCurrentSampleRate() : 44100.0;
+              const int bufSize = d ? d->getCurrentBufferSizeSamples() : 512;
+              const int outLatSamples = d ? d->getOutputLatencyInSamples() : bufSize;
+              const float delayMs = (float)((double)juce::jmax(bufSize, outLatSamples) * 1000.0 / juce::jmax(1.0, sr));
+
+              currentSampleRate.store(sr, std::memory_order_release);
+              currentBufferSize.store(bufSize, std::memory_order_release);
+              measuredOutputDelayMs.store(delayMs, std::memory_order_release);
+
               noteTracker.setBeatsPerBar(4);
               noteTracker.resetAudioClock();
               scheduler.setSampleRate(sr);
               synth.initialize(sr);
-              synth.prepareLimiterForBlock(juce::jmax(4096, d->getCurrentBufferSizeSamples()));
+              synth.prepareLimiterForBlock(juce::jmax(4096, bufSize));
+
+              if (audioSessionActive.load(std::memory_order_acquire)) {
+                  PitchDetector* det = activeDetector.load(std::memory_order_acquire);
+                  if (det == nullptr || std::abs(det->getInputSampleRate() - sr) >= 0.5) {
+                      // Detach current detector immediately so audio thread never feeds mismatched rate,
+                      // and recreate on the UI thread with the new sample rate.
+                      activeDetector.store(nullptr, std::memory_order_release);
+                      scheduleDetectorRecreateOnUiThread(sr);
+                  }
+              }
           }
 
-          void MainComponent::audioDeviceStopped() { pitchDetector.reset(); }
+          void MainComponent::audioDeviceStopped() {
+              activeDetector.store(nullptr, std::memory_order_release);
+              measuredOutputDelayMs.store(0.0f, std::memory_order_release);
+          }
 
           void MainComponent::audioDeviceIOCallbackWithContext(
               const float* const* in, int nIn, float* const* out, int nOut, int n,
               const juce::AudioIODeviceCallbackContext&)
           {
+              PitchDetector* det = activeDetector.load(std::memory_order_acquire);
               const bool hasMic = (nIn > 0 && in != nullptr && in[0] != nullptr && n > 0);
               float micRms = 0.0f;
               if (hasMic) {
-                  if (pitchDetector) pitchDetector->feed(in[0], n);
+                  if (det) det->feed(in[0], n);
                   double sq = 0.0;
                   for (int i = 0; i < n; ++i) sq += (double)in[0][i] * (double)in[0][i];
                   micRms = (float)std::sqrt(sq / (double)n);
               }
               currentEnergy.store(micRms);
 
-              auto frame = pitchDetector ? pitchDetector->latestFrame() : PitchDetector::Frame{};
+              auto frame = det ? det->latestFrame() : PitchDetector::Frame{};
               frame.rms = micRms;
 
               currentFreq.store(frame.voiced ? frame.frequency : 0.0f);
@@ -1825,10 +2210,10 @@ jobs:
               noteTracker.processBlockFrames(frame, scheduler.getBeatPosition(), scheduler.getCurrentBar(),
                                              n, currentSampleRate.load());
 
-              scheduler.processBlock(n, synth);
-              if (nOut >= 1 && out != nullptr && out[0] != nullptr) {
-                  synth.render(out[0], (nOut >= 2 ? out[1] : nullptr), n);
-              }
+              float* leftOut = (nOut >= 1 && out != nullptr && out[0] != nullptr) ? out[0] : nullptr;
+              float* rightOut = (nOut >= 2 && out != nullptr && out[1] != nullptr) ? out[1] : nullptr;
+              scheduler.processBlockStereo(leftOut, rightOut, n, synth);
+
               for (int ch = 2; ch < nOut; ++ch)
                   if (out != nullptr && out[ch] != nullptr) juce::FloatVectorOperations::clear(out[ch], n);
           }
@@ -1861,7 +2246,7 @@ jobs:
                   juce::String name = (ch == 9) ? "Drums" :
                       juce::String(GM_NAMES[juce::jlimit(0, 127, snap.ch[ch].preset)]);
                   l->setText(name, juce::dontSendNotification);
-                  styleLabel(*l, 11.0f, juce::Colours::white);
+                  applyLabelStyle(*l, 11.0f, juce::Colours::white);
                   addAndMakeVisible(l);
                   channelLabels.add(l);
               }
@@ -1870,6 +2255,10 @@ jobs:
 
           void MainComponent::sendState(bool phraseEnd) {
               if (!arranger) return;
+              const bool locked = !scheduler.getFollowServerTempo();
+              juce::String selectedStyle = styleComboBox.getText().trim().toLowerCase();
+              if (selectedStyle.isEmpty()) selectedStyle = "auto";
+
               juce::var root(new juce::DynamicObject());
               auto* o = root.getDynamicObject();
               o->setProperty("type", "state");
@@ -1877,7 +2266,8 @@ jobs:
               o->setProperty("singing", noteTracker.isSinging());
               o->setProperty("loudness", noteTracker.getLoudness());
               o->setProperty("loudnessTrend", noteTracker.getLoudnessTrend());
-              o->setProperty("tempo", scheduler.getTempo());
+              o->setProperty("tempo", locked ? tempoSlider.getValue() : scheduler.getTempo());
+              o->setProperty("tempoLocked", locked);
               o->setProperty("bar", scheduler.getCurrentBar());
               o->setProperty("beat", scheduler.getBeatPosition());
               o->setProperty("chord", chordInference.getChord());
@@ -1887,7 +2277,7 @@ jobs:
               o->setProperty("keyConfidence", userKeyConf.load());
               o->setProperty("userTempo", userTempoBpm.load());
               o->setProperty("userTempoConfidence", userTempoConf.load());
-              o->setProperty("style", "pop");
+              o->setProperty("style", selectedStyle);
               o->setProperty("phraseEnd", phraseEnd);
 
               juce::Array<juce::var> jnotes;
@@ -1962,6 +2352,16 @@ jobs:
                   stateLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
               }
 
+              PitchDetector* det = activeDetector.load(std::memory_order_acquire);
+              const int detSrHz = det ? (int)std::llround(det->getInputSampleRate())
+                                      : (int)std::llround(detectorSampleRate.load(std::memory_order_acquire));
+              const int detAnaHz = det ? (int)std::llround(det->getAnalysisSampleRate()) : 0;
+              latencyLabel.setText(
+                  "Latency: buf " + juce::String(currentBufferSize.load()) + " smp | out "
+                  + juce::String(measuredOutputDelayMs.load(), 1) + " ms | det "
+                  + juce::String(detSrHz) + "->" + juce::String(detAnaHz) + " Hz",
+                  juce::dontSendNotification);
+
               juce::String keyStr = juce::String(GM_KEYS[userKeyPc.load()])
                                   + (userKeyMinor.load() ? " minor" : " major");
               keyLabel.setText("Key: " + keyStr + " (" + juce::String((int)(userKeyConf.load() * 100)) + "%)",
@@ -2021,8 +2421,9 @@ jobs:
           void MainComponent::resized() {
               auto area = getLocalBounds().reduced(16);
               auto top = area.removeFromTop(26);
-              stateLabel.setBounds(top.removeFromLeft(top.getWidth() * 2 / 3));
-              rttLabel.setBounds(top);
+              stateLabel.setBounds(top.removeFromLeft(top.getWidth() / 3));
+              rttLabel.setBounds(top.removeFromLeft(top.getWidth() / 3));
+              latencyLabel.setBounds(top);
               area.removeFromTop(6);
               noteLabel.setBounds(area.removeFromTop(64));
               chordLabel.setBounds(area.removeFromTop(42));
@@ -2031,16 +2432,19 @@ jobs:
               speakerHintLabel.setBounds(area.removeFromTop(20));
 
               auto tempoRow = area.removeFromTop(30);
-              tempoLabel.setBounds(tempoRow.removeFromLeft(tempoRow.getWidth() * 2 / 3));
-              tempoSlider.setBounds(tempoRow.removeFromLeft(200).reduced(2));
+              tempoLabel.setBounds(tempoRow.removeFromLeft(tempoRow.getWidth() / 2));
+              followTempoToggle.setBounds(tempoRow.removeFromLeft(175));
+              tempoSlider.setBounds(tempoRow.reduced(2));
 
               auto micRow = area.removeFromTop(30);
               micSensitivityLabel.setBounds(micRow.removeFromLeft(120));
               micLevelMeter.setBounds(micRow.removeFromLeft(110).reduced(4));
               micSensitivitySlider.setBounds(micRow.reduced(2));
 
-              auto modeRow = area.removeFromTop(28);
-              speakerModeToggle.setBounds(modeRow.removeFromLeft(180));
+              auto modeRow = area.removeFromTop(30);
+              speakerModeToggle.setBounds(modeRow.removeFromLeft(175));
+              styleTitleLabel.setBounds(modeRow.removeFromLeft(60));
+              styleComboBox.setBounds(modeRow.removeFromLeft(150).reduced(2));
 
               auto buttons = area.removeFromBottom(46);
               startButton.setBounds(buttons.removeFromLeft(buttons.getWidth() / 2).reduced(6));
@@ -2065,7 +2469,7 @@ jobs:
           class AILiveBandApplication : public juce::JUCEApplication {
           public:
               const juce::String getApplicationName() override    { return "AI Live Band"; }
-              const juce::String getApplicationVersion() override { return "0.4.0"; }
+              const juce::String getApplicationVersion() override { return "0.4.2"; }
               bool moreThanOneInstanceAllowed() override          { return true; }
               void initialise(const juce::String&) override { mainWindow.reset(new MainWindow(getApplicationName())); }
               void shutdown() override { mainWindow.reset(); }
@@ -2107,9 +2511,6 @@ jobs:
             AILiveBand.jucer
             Source/
 
-  # ─────────────────────────────────────────────
-  # 1. LINUX
-  # ─────────────────────────────────────────────
   build-linux:
     needs: scaffold
     runs-on: ubuntu-latest
@@ -2144,9 +2545,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: AILiveBand-linux, path: AILiveBand-linux.tar.gz, if-no-files-found: error }
 
-  # ─────────────────────────────────────────────
-  # 2. WINDOWS
-  # ─────────────────────────────────────────────
   build-windows:
     needs: scaffold
     runs-on: windows-latest
@@ -2172,9 +2570,6 @@ jobs:
           path: build/AILiveBand_artefacts/Release/AI Live Band.exe
           if-no-files-found: error
 
-  # ─────────────────────────────────────────────
-  # 3. MACOS
-  # ─────────────────────────────────────────────
   build-macos:
     needs: scaffold
     runs-on: macos-latest
@@ -2202,9 +2597,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: AILiveBand-macos, path: AILiveBand-macos.tar.gz, if-no-files-found: error }
 
-  # ─────────────────────────────────────────────
-  # 4. ANDROID
-  # ─────────────────────────────────────────────
   build-android:
     needs: scaffold
     runs-on: ubuntu-latest
