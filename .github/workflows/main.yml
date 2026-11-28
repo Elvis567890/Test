@@ -2515,8 +2515,7 @@ jobs:
             CMakeLists.txt
             AILiveBand.jucer
             Source/
-
-  build-android:
+build-android:
     needs: scaffold
     runs-on: ubuntu-latest
     timeout-minutes: 90
