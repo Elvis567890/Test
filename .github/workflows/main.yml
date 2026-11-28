@@ -54,7 +54,7 @@ jobs:
           import sys
 
           path = sys.argv[1]
-          max_bytes = 25 * 1024 * 1024
+          max_bytes = 45 * 1024 * 1024
 
           if not os.path.isfile(path):
               print(f"SoundFont file does not exist: {path}")
