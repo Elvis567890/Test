@@ -54,7 +54,7 @@ jobs:
           import sys
 
           path = sys.argv[1]
-          max_bytes = 45 * 1024 * 1024
+          max_bytes = 25 * 1024 * 1024
 
           if not os.path.isfile(path):
               print(f"SoundFont file does not exist: {path}")
@@ -72,31 +72,35 @@ jobs:
               print("File is not a valid RIFF/sfbk SF2 SoundFont.")
               sys.exit(1)
 
-          idx = data.find(b"LIST")
-          pdta_offset = -1
-          while idx >= 0 and idx + 12 <= len(data):
-              if data[idx + 8:idx + 12] == b"pdta":
-                  pdta_offset = idx
+          riff_end = min(len(data), 8 + struct.unpack("<I", data[4:8])[0])
+          pos = 12
+          pdta_start = -1
+          pdta_end = -1
+
+          while pos + 8 <= riff_end:
+              ct = data[pos:pos + 4]
+              cs = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+              chunk_start = pos + 8
+              chunk_end = min(riff_end, chunk_start + cs)
+              if ct == b"LIST" and chunk_end - chunk_start >= 4 and data[chunk_start:chunk_start + 4] == b"pdta":
+                  pdta_start = chunk_start + 4
+                  pdta_end = chunk_end
                   break
-              chunk_len = struct.unpack("<I", data[idx + 4:idx + 8])[0]
-              idx = data.find(b"LIST", idx + 8 + chunk_len)
+              pos = chunk_start + cs + (cs & 1)
 
-          if pdta_offset < 0:
-              print("SF2 file missing pdta chunk.")
+          if pdta_start < 0:
+              print("SF2 file missing pdta LIST chunk.")
               sys.exit(1)
-
-          pos = pdta_offset + 12
-          pdta_size = struct.unpack("<I", data[pdta_offset + 4:pdta_offset + 8])[0]
-          end = min(len(data), pdta_offset + 8 + pdta_size)
 
           presets = set()
           has_drums = False
+          p = pdta_start
 
-          while pos + 8 <= end:
-              ct = data[pos:pos + 4]
-              cs = struct.unpack("<I", data[pos + 4:pos + 8])[0]
-              payload_start = pos + 8
-              payload_end = min(end, payload_start + cs)
+          while p + 8 <= pdta_end:
+              ct = data[p:p + 4]
+              cs = struct.unpack("<I", data[p + 4:p + 8])[0]
+              payload_start = p + 8
+              payload_end = min(pdta_end, payload_start + cs)
               if ct == b"phdr" and (payload_end - payload_start) >= 38:
                   n = ((payload_end - payload_start) // 38) - 1
                   phdr = data[payload_start:payload_end]
@@ -104,11 +108,11 @@ jobs:
                       o = i * 38
                       preset = struct.unpack("<H", phdr[o + 20:o + 22])[0]
                       bank = struct.unpack("<H", phdr[o + 22:o + 24])[0]
-                      if bank == 0 and preset < 128:
+                      if bank == 0 and 0 <= preset < 128:
                           presets.add(preset)
                       if bank == 128:
                           has_drums = True
-              pos = payload_start + cs + (cs & 1)
+              p = payload_start + cs + (cs & 1)
 
           print(f"GM presets: {len(presets)}/128, drums: {has_drums}, size: {size} bytes")
           if len(presets) < 128 or not has_drums:
@@ -122,21 +126,8 @@ jobs:
             cp "$REPO_SF2" SoundFont.sf2
             echo "OK: Validated and staged $REPO_SF2"
           else
-            echo "assets/SoundFont.sf2 not in repo; attempting fallback SoundFont download..."
-            SF2_FALLBACK_URLS="https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/master/GeneralUser-GS.sf2 https://github.com/mrbumpy409/GeneralUser-GS/raw/main/GeneralUser-GS.sf2"
-            got_sf2=0
-            for sf_url in $SF2_FALLBACK_URLS; do
-              if curl -fsSL --retry 3 --retry-delay 3 -o SoundFont.sf2 "$sf_url" && python3 verify_sf2.py SoundFont.sf2; then
-                echo "OK: Downloaded and validated fallback SoundFont from $sf_url"
-                got_sf2=1
-                break
-              fi
-              rm -f SoundFont.sf2
-            done
-            if [ "$got_sf2" != "1" ]; then
-              echo "::error::No valid SoundFont found at assets/SoundFont.sf2 and fallback download failed."
-              exit 1
-            fi
+            echo "::error::Required SoundFont file 'assets/SoundFont.sf2' is missing from the repository."
+            exit 1
           fi
 
       - name: Create project files
