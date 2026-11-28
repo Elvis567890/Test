@@ -2644,7 +2644,7 @@ jobs:
           ks_path = f"{home}/.android/debug.keystore"
           signing_block = f"""
     signingConfigs {{
-        debug {{
+debug {{
             storeFile file("{ks_path}")
             storePassword "android"
             keyAlias "androiddebugkey"
