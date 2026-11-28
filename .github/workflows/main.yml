@@ -54,7 +54,7 @@ jobs:
           import sys
 
           path = sys.argv[1]
-          max_bytes = 25 * 1024 * 1024
+          max_bytes = 45 * 1024 * 1024
 
           if not os.path.isfile(path):
               print(f"SoundFont file does not exist: {path}")
@@ -72,35 +72,31 @@ jobs:
               print("File is not a valid RIFF/sfbk SF2 SoundFont.")
               sys.exit(1)
 
-          riff_end = min(len(data), 8 + struct.unpack("<I", data[4:8])[0])
-          pos = 12
-          pdta_start = -1
-          pdta_end = -1
-
-          while pos + 8 <= riff_end:
-              ct = data[pos:pos + 4]
-              cs = struct.unpack("<I", data[pos + 4:pos + 8])[0]
-              chunk_start = pos + 8
-              chunk_end = min(riff_end, chunk_start + cs)
-              if ct == b"LIST" and chunk_end - chunk_start >= 4 and data[chunk_start:chunk_start + 4] == b"pdta":
-                  pdta_start = chunk_start + 4
-                  pdta_end = chunk_end
+          idx = data.find(b"LIST")
+          pdta_offset = -1
+          while idx >= 0 and idx + 12 <= len(data):
+              if data[idx + 8:idx + 12] == b"pdta":
+                  pdta_offset = idx
                   break
-              pos = chunk_start + cs + (cs & 1)
+              chunk_len = struct.unpack("<I", data[idx + 4:idx + 8])[0]
+              idx = data.find(b"LIST", idx + 8 + chunk_len)
 
-          if pdta_start < 0:
-              print("SF2 file missing pdta LIST chunk.")
+          if pdta_offset < 0:
+              print("SF2 file missing pdta chunk.")
               sys.exit(1)
+
+          pos = pdta_offset + 12
+          pdta_size = struct.unpack("<I", data[pdta_offset + 4:pdta_offset + 8])[0]
+          end = min(len(data), pdta_offset + 8 + pdta_size)
 
           presets = set()
           has_drums = False
-          p = pdta_start
 
-          while p + 8 <= pdta_end:
-              ct = data[p:p + 4]
-              cs = struct.unpack("<I", data[p + 4:p + 8])[0]
-              payload_start = p + 8
-              payload_end = min(pdta_end, payload_start + cs)
+          while pos + 8 <= end:
+              ct = data[pos:pos + 4]
+              cs = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+              payload_start = pos + 8
+              payload_end = min(end, payload_start + cs)
               if ct == b"phdr" and (payload_end - payload_start) >= 38:
                   n = ((payload_end - payload_start) // 38) - 1
                   phdr = data[payload_start:payload_end]
@@ -108,11 +104,11 @@ jobs:
                       o = i * 38
                       preset = struct.unpack("<H", phdr[o + 20:o + 22])[0]
                       bank = struct.unpack("<H", phdr[o + 22:o + 24])[0]
-                      if bank == 0 and 0 <= preset < 128:
+                      if bank == 0 and preset < 128:
                           presets.add(preset)
                       if bank == 128:
                           has_drums = True
-              p = payload_start + cs + (cs & 1)
+              pos = payload_start + cs + (cs & 1)
 
           print(f"GM presets: {len(presets)}/128, drums: {has_drums}, size: {size} bytes")
           if len(presets) < 128 or not has_drums:
@@ -126,8 +122,21 @@ jobs:
             cp "$REPO_SF2" SoundFont.sf2
             echo "OK: Validated and staged $REPO_SF2"
           else
-            echo "::error::Required SoundFont file 'assets/SoundFont.sf2' is missing from the repository."
-            exit 1
+            echo "assets/SoundFont.sf2 not in repo; attempting fallback SoundFont download..."
+            SF2_FALLBACK_URLS="https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/master/GeneralUser-GS.sf2 https://github.com/mrbumpy409/GeneralUser-GS/raw/main/GeneralUser-GS.sf2"
+            got_sf2=0
+            for sf_url in $SF2_FALLBACK_URLS; do
+              if curl -fsSL --retry 3 --retry-delay 3 -o SoundFont.sf2 "$sf_url" && python3 verify_sf2.py SoundFont.sf2; then
+                echo "OK: Downloaded and validated fallback SoundFont from $sf_url"
+                got_sf2=1
+                break
+              fi
+              rm -f SoundFont.sf2
+            done
+            if [ "$got_sf2" != "1" ]; then
+              echo "::error::No valid SoundFont found at assets/SoundFont.sf2 and fallback download failed."
+              exit 1
+            fi
           fi
 
       - name: Create project files
@@ -705,6 +714,7 @@ jobs:
           #include <JuceHeader.h>
           #include <algorithm>
           #include <cmath>
+          #include <cstddef>
 
           void KeyEstimator::reset() {
               for (auto& w : weights) w = 0.0f;
@@ -714,7 +724,8 @@ jobs:
           void KeyEstimator::addNoteDuration(int midi, double durationBeats) {
               for (auto& w : weights) w *= 0.995f;
               float d = (float)juce::jlimit(0.05, 4.0, durationBeats);
-              weights[((midi % 12) + 12) % 12] += d;
+              size_t pc = (size_t)(((midi % 12) + 12) % 12);
+              weights[pc] += d;
               total = 0.0f;
               for (auto w : weights) total += w;
               if (total > 200.0f) {
@@ -727,11 +738,11 @@ jobs:
           KeyEstimator::Result KeyEstimator::estimate() const {
               static const float MAJ[12] = {6.35f,2.23f,3.48f,2.33f,4.38f,4.09f,2.52f,5.19f,2.39f,3.66f,2.29f,2.88f};
               static const float MIN[12] = {6.33f,2.68f,3.52f,5.38f,2.60f,3.53f,2.54f,4.75f,3.98f,2.69f,3.34f,3.17f};
-              auto corr = [&](const float* profile, int tonic) {
-                  float mP = 0.0f; for (int i = 0; i < 12; ++i) mP += profile[i]; mP /= 12.0f;
+              auto corr = [&](const float* profile, size_t tonic) {
+                  float mP = 0.0f; for (size_t i = 0; i < 12; ++i) mP += profile[i]; mP /= 12.0f;
                   float mW = total / 12.0f;
                   float num = 0, dw2 = 0, dp2 = 0;
-                  for (int i = 0; i < 12; ++i) {
+                  for (size_t i = 0; i < 12; ++i) {
                       float dw = weights[(tonic + i) % 12] - mW;
                       float dp = profile[i] - mP;
                       num += dw * dp; dw2 += dw * dw; dp2 += dp * dp;
@@ -740,12 +751,12 @@ jobs:
                   return den > 1e-6f ? num / den : 0.0f;
               };
               float best = -2.0f;
-              int   bestTonic = 0; bool bestMinor = false;
-              for (int T = 0; T < 12; ++T) {
+              int bestTonic = 0; bool bestMinor = false;
+              for (size_t T = 0; T < 12; ++T) {
                   float cM = corr(MAJ, T);
-                  if (cM > best) { best = cM; bestTonic = T; bestMinor = false; }
+                  if (cM > best) { best = cM; bestTonic = (int)T; bestMinor = false; }
                   float cm = corr(MIN, T);
-                  if (cm > best) { best = cm; bestTonic = T; bestMinor = true; }
+                  if (cm > best) { best = cm; bestTonic = (int)T; bestMinor = true; }
               }
               return { bestTonic, bestMinor, juce::jlimit(0.0f, 1.0f, best) };
           }
@@ -772,6 +783,7 @@ jobs:
           #include "TempoEstimator.h"
           #include <JuceHeader.h>
           #include <algorithm>
+          #include <cstddef>
 
           void TempoEstimator::reset() {
               iois.fill(0.0);
@@ -784,7 +796,7 @@ jobs:
               if (lastOnset > 0) {
                   double ioi = t - lastOnset;
                   if (ioi > 0.1 && ioi < 2.0) {
-                      iois[idx] = ioi; idx = (idx + 1) % kMax;
+                      iois[(size_t)idx] = ioi; idx = (idx + 1) % kMax;
                       if (count < kMax) ++count;
                   }
               }
@@ -794,9 +806,9 @@ jobs:
               if (count < 3) return {120.0, 0.0f};
               std::array<double, kMax> s = iois;
               std::sort(s.begin(), s.begin() + count);
-              double median = s[count / 2];
-              double q1 = s[count / 4];
-              double q3 = s[(3 * count) / 4];
+              double median = s[(size_t)(count / 2)];
+              double q1 = s[(size_t)(count / 4)];
+              double q3 = s[(size_t)((3 * count) / 4)];
               double iqr = q3 - q1;
               double bpm = 60.0 / median;
               if (bpm < 40.0 || bpm > 240.0) return {120.0, 0.0f};
@@ -1911,7 +1923,7 @@ jobs:
               std::vector<NoteEventRecord> pendingNotesForSend;
               double lastSendMs = 0.0;
               int64_t nextPingMs = 0;
-              juce::WeakReference<MainComponent> safeThis { this };
+              juce::Component::SafePointer<MainComponent> safeThis { this };
           };
           EOF
 
@@ -2061,7 +2073,7 @@ jobs:
           }
 
           void MainComponent::scheduleDetectorRecreateOnUiThread(double sr) {
-              juce::WeakReference<MainComponent> weakRef = safeThis;
+              juce::Component::SafePointer<MainComponent> weakRef = safeThis;
               juce::MessageManager::callAsync([weakRef, sr]() {
                   if (weakRef == nullptr) return;
                   if (!weakRef->audioSessionActive.load(std::memory_order_acquire)) return;
