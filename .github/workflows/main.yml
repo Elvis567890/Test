@@ -2643,15 +2643,18 @@ jobs:
           txt = open(path).read()
           ks_path = f"{home}/.android/debug.keystore"
           signing_block = f"""
-    signingConfigs {{
-debug {{
-            storeFile file("{ks_path}")
-            storePassword "android"
-            keyAlias "androiddebugkey"
-            keyPassword "android"
-        }}
-    }}
-"""
+    - name: Patch Gradle File
+  run: |
+    python3 -c "
+    import re
+    path = 'android/app/build.gradle'
+    # ... your logic here ...
+    signing_block = '''signingConfigs {
+        debug {
+            storeFile file('...')
+        }
+    }'''
+    "
           if "signingConfigs" not in txt:
               txt = txt.replace("android {\n", "android {\n" + signing_block, 1)
           open(path, "w").write(txt)
