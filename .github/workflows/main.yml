@@ -1720,19 +1720,28 @@ jobs:
 
           class Arranger {
           public:
+              enum class ConnectionState { Disconnected, Connecting, Connected };
+
               Arranger();
               ~Arranger();
               void start();
               void stop();
               void sendStateJson(const juce::String& json);
               std::vector<std::shared_ptr<PlanPayload>> drainPlans();
-              bool  isConnected() const { return connected.load(); }
-              float getRttMs()    const { return rttMs.load(); }
+              bool isConnected() const { return connectionState.load() == ConnectionState::Connected; }
+              ConnectionState getConnectionState() const { return connectionState.load(); }
+              juce::String getStatusDetail() const;
+              float getRttMs() const { return rttMs.load(); }
+              bool consumeJustOpened();
           private:
+              void setStatusDetail(const juce::String& s);
               void handleMessage(const std::string& text);
               std::unique_ptr<ix::WebSocket> webSocket;
-              std::atomic<bool>  connected { false };
-              std::atomic<float> rttMs     { 0.0f };
+              std::atomic<ConnectionState> connectionState { ConnectionState::Disconnected };
+              std::atomic<bool> justOpened { false };
+              std::atomic<float> rttMs { 0.0f };
+              mutable juce::CriticalSection statusLock;
+              juce::String statusDetail { "idle" };
               juce::CriticalSection plansLock;
               std::vector<std::shared_ptr<PlanPayload>> pendingPlans;
           };
@@ -1755,32 +1764,78 @@ jobs:
           Arranger::Arranger() { ix::initNetSystem(); webSocket = std::make_unique<ix::WebSocket>(); }
           Arranger::~Arranger() { stop(); webSocket.reset(); ix::uninitNetSystem(); }
 
+          void Arranger::setStatusDetail(const juce::String& s) {
+              const juce::ScopedLock sl(statusLock);
+              statusDetail = s;
+          }
+
+          juce::String Arranger::getStatusDetail() const {
+              const juce::ScopedLock sl(statusLock);
+              return statusDetail;
+          }
+
+          bool Arranger::consumeJustOpened() {
+              return justOpened.exchange(false, std::memory_order_acq_rel);
+          }
+
           void Arranger::start() {
+              if (!webSocket) return;
+              connectionState.store(ConnectionState::Connecting, std::memory_order_release);
+              setStatusDetail("dialing server...");
+
               juce::String url = juce::String(AI_LIVE_BAND_SERVER_URL) + "/?token=" + juce::String(AI_LIVE_BAND_ACCESS_TOKEN);
               webSocket->setUrl(url.toStdString());
-              webSocket->setPingInterval(30);
+              webSocket->setPingInterval(15);
               webSocket->enableAutomaticReconnection();
               webSocket->setMinWaitBetweenReconnectionRetries(1000);
-              webSocket->setMaxWaitBetweenReconnectionRetries(5000);
+              webSocket->setMaxWaitBetweenReconnectionRetries(4000);
               webSocket->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
-                  if (msg->type == ix::WebSocketMessageType::Open) connected.store(true);
-                  else if (msg->type == ix::WebSocketMessageType::Close) connected.store(false);
-                  else if (msg->type == ix::WebSocketMessageType::Message) handleMessage(msg->str);
-                  else if (msg->type == ix::WebSocketMessageType::Error) connected.store(false);
+                  if (msg->type == ix::WebSocketMessageType::Open) {
+                      connectionState.store(ConnectionState::Connected, std::memory_order_release);
+                      justOpened.store(true, std::memory_order_release);
+                      setStatusDetail("live");
+                      if (webSocket) {
+                          const double now = juce::Time::getMillisecondCounterHiRes();
+                          juce::var pv(new juce::DynamicObject());
+                          pv.getDynamicObject()->setProperty("type", "ping");
+                          pv.getDynamicObject()->setProperty("ts", now);
+                          webSocket->send(juce::JSON::toString(pv, false).toStdString());
+                      }
+                  } else if (msg->type == ix::WebSocketMessageType::Close) {
+                      connectionState.store(ConnectionState::Connecting, std::memory_order_release);
+                      juce::String reason = juce::String(msg->closeInfo.reason).trim();
+                      if (reason.isEmpty()) reason = "code " + juce::String(msg->closeInfo.code);
+                      setStatusDetail("closed (" + reason + "), retrying...");
+                  } else if (msg->type == ix::WebSocketMessageType::Message) {
+                      handleMessage(msg->str);
+                  } else if (msg->type == ix::WebSocketMessageType::Error) {
+                      connectionState.store(ConnectionState::Connecting, std::memory_order_release);
+                      juce::String err = juce::String(msg->errorInfo.reason).trim();
+                      if (err.isEmpty()) err = "network/port unreachable";
+                      setStatusDetail("err: " + err);
+                  }
               });
               webSocket->start();
           }
-          void Arranger::stop() { if (webSocket) webSocket->stop(); connected.store(false); }
+
+          void Arranger::stop() {
+              if (webSocket) webSocket->stop();
+              connectionState.store(ConnectionState::Disconnected, std::memory_order_release);
+              setStatusDetail("stopped");
+          }
+
           void Arranger::sendStateJson(const juce::String& j) {
-              if (!webSocket || !connected.load()) return;
+              if (!webSocket || !isConnected()) return;
               webSocket->send(j.toStdString());
           }
+
           std::vector<std::shared_ptr<PlanPayload>> Arranger::drainPlans() {
               const juce::ScopedLock sl(plansLock);
               auto out = std::move(pendingPlans);
               pendingPlans.clear();
               return out;
           }
+
           void Arranger::handleMessage(const std::string& text) {
               try {
                   auto v = juce::JSON::parse(juce::String(text));
@@ -1830,7 +1885,7 @@ jobs:
                   } else if (type == "pong") {
                       if (hasExistingValue(o, "ts")) {
                           double t0 = (double)o->getProperty("ts");
-                          if (t0 > 0) rttMs.store((float)(juce::Time::getMillisecondCounterHiRes() - t0));
+                          if (t0 > 0) rttMs.store((float)juce::jmax(0.0, juce::Time::getMillisecondCounterHiRes() - t0));
                       }
                   }
               } catch (...) {}
@@ -1948,13 +2003,13 @@ jobs:
               applyLabelStyle(tempoLabel, 18.0f, juce::Colour::fromRGB(180,220,255));
               applyLabelStyle(instrumentsLabel, 13.0f, juce::Colour::fromRGB(200,200,200));
               applyLabelStyle(speakerHintLabel, 13.0f, juce::Colours::orange);
-              applyLabelStyle(rttLabel, 13.0f, juce::Colours::grey);
+              applyLabelStyle(rttLabel, 12.0f, juce::Colours::grey);
               applyLabelStyle(latencyLabel, 12.0f, juce::Colour::fromRGB(160, 220, 190));
               applyLabelStyle(micSensitivityLabel, 13.0f, juce::Colours::lightgrey);
               applyLabelStyle(styleTitleLabel, 13.0f, juce::Colours::lightgrey);
 
               speakerHintLabel.setText("Speaker mode off (raises threshold when on)", juce::dontSendNotification);
-              rttLabel.setText("RTT: --", juce::dontSendNotification);
+              rttLabel.setText("NET: --", juce::dontSendNotification);
               latencyLabel.setText("Latency: buf -- | out -- ms | det -- Hz", juce::dontSendNotification);
               keyLabel.setText("Key: - (0%)", juce::dontSendNotification);
               tempoLabel.setText("120 BPM", juce::dontSendNotification);
@@ -2146,8 +2201,11 @@ jobs:
               deviceManager.addAudioCallback(this);
               arranger = std::make_unique<Arranger>();
               arranger->start();
+              lastSendMs = 0.0;
+              nextPingMs = 0;
               startButton.setButtonText("Stop");
               stateLabel.setText("CONNECTING...", juce::dontSendNotification);
+              rttLabel.setText("CONNECTING...", juce::dontSendNotification);
           }
 
           void MainComponent::stopAudio() {
@@ -2160,6 +2218,7 @@ jobs:
               scheduler.stop();
               destroyDetectorOnUiThread();
               synth.allNotesOff();
+              rttLabel.setText("NET: --", juce::dontSendNotification);
           }
 
           void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* d) {
@@ -2259,7 +2318,7 @@ jobs:
           }
 
           void MainComponent::sendState(bool phraseEnd) {
-              if (!arranger) return;
+              if (!arranger || !arranger->isConnected()) return;
               const bool locked = !scheduler.getFollowServerTempo();
               juce::String selectedStyle = styleComboBox.getText().trim().toLowerCase();
               if (selectedStyle.isEmpty()) selectedStyle = "auto";
@@ -2388,23 +2447,29 @@ jobs:
               rebuildMixerFromSnapshot(snap);
 
               if (arranger) {
-                  if (arranger->isConnected())
-                      rttLabel.setText("RTT: " + juce::String((int)arranger->getRttMs()) + " ms", juce::dontSendNotification);
-                  else
-                      rttLabel.setText("OFFLINE (looping last bar)", juce::dontSendNotification);
                   const double now = juce::Time::getMillisecondCounterHiRes();
-                  bool phraseEnd = noteTracker.drainPhraseEnd();
-                  if (phraseEnd || (now - lastSendMs >= 100.0)) {
-                      lastSendMs = now;
-                      sendState(phraseEnd);
-                  }
-                  if (now >= (double)nextPingMs) {
-                      nextPingMs = (int64_t)now + 3000;
-                      if (arranger->isConnected()) {
+                  const bool openedNow = arranger->consumeJustOpened();
+                  if (arranger->isConnected()) {
+                      rttLabel.setText("LIVE RTT: " + juce::String((int)arranger->getRttMs()) + " ms", juce::dontSendNotification);
+                      bool phraseEnd = noteTracker.drainPhraseEnd();
+                      if (openedNow || phraseEnd || (now - lastSendMs >= 100.0)) {
+                          lastSendMs = now;
+                          sendState(phraseEnd);
+                      }
+                      if (now >= (double)nextPingMs) {
+                          nextPingMs = (int64_t)now + 2500;
                           juce::var pv(new juce::DynamicObject());
                           pv.getDynamicObject()->setProperty("type", "ping");
                           pv.getDynamicObject()->setProperty("ts", now);
                           arranger->sendStateJson(juce::JSON::toString(pv, false));
+                      }
+                  } else {
+                      auto cstate = arranger->getConnectionState();
+                      juce::String detail = arranger->getStatusDetail();
+                      if (cstate == Arranger::ConnectionState::Connecting) {
+                          rttLabel.setText("CONNECTING: " + detail, juce::dontSendNotification);
+                      } else {
+                          rttLabel.setText("OFFLINE (" + detail + ")", juce::dontSendNotification);
                       }
                   }
               }
