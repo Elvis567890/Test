@@ -2515,7 +2515,8 @@ jobs:
             CMakeLists.txt
             AILiveBand.jucer
             Source/
-build-android:
+
+  build-android:
     needs: scaffold
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -2588,16 +2589,8 @@ build-android:
           import re, sys
           path, ws = sys.argv[1], sys.argv[2]
           lines = open(path).read().split("\n")
-          lines = [l for l in lines if not re.search(r"target_link_libraries.*AILiveBand", l)]
           abi_var = "$" + "{ANDROID_ABI}"
           inject = [
-              'function(target_link_libraries)',
-              '  if(TARGET "${ARGV0}")',
-              '    _target_link_libraries(${ARGV})',
-              '  else()',
-              '    message(WARNING "Skipping target_link_libraries for missing target ${ARGV0}")',
-              '  endif()',
-              'endfunction()',
               'include_directories("%s/ixwebsocket-android/include")' % ws,
               'link_libraries("%s/ixwebsocket-android/libs/%s/libixwebsocket.a")' % (ws, abi_var),
           ]
@@ -2636,26 +2629,16 @@ build-android:
             if ! grep -q ndkVersion "$GRADLE_FILE"; then
               sed -i "0,/^android {/s//android {\n    ndkVersion \"$ANDROID_NDK_VERSION\"/" "$GRADLE_FILE"
             fi
-            python3 - "$GRADLE_FILE" "$HOME" <<'PY'
+            python3 - "$GRADLE_FILE" <<'PY'
           import sys
-          path, home = sys.argv[1], sys.argv[2]
+          path = sys.argv[1]
           txt = open(path).read()
-          ks_path = f"{home}/.android/debug.keystore"
-          signing_block = f"""
-    - name: Patch Gradle File
-  run: |
-    python3 -c "
-    import re
-    path = 'android/app/build.gradle'
-    # ... your logic here ...
-    signing_block = '''signingConfigs {
-        debug {
-            storeFile file('...')
-        }
-    }'''
-    "
-          if "signingConfigs" not in txt:
-              txt = txt.replace("android {\n", "android {\n" + signing_block, 1)
+          if "noCompress" not in txt:
+              txt = txt.replace(
+                  "android {\n",
+                  "android {\n    aaptOptions {\n        noCompress 'sf2'\n    }\n",
+                  1,
+              )
           open(path, "w").write(txt)
           PY
           fi
@@ -2702,7 +2685,15 @@ build-android:
         run: |
           cd Builds/Android
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace --info
+          set +e
+          ./gradlew assembleDebug --no-daemon --stacktrace | tee "$GITHUB_WORKSPACE/gradle.log"
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::Gradle assembleDebug failed (exit $RC). Key failure lines:"
+            grep -E "FAILURE:|Execution failed for task|Caused by:|Exception" "$GITHUB_WORKSPACE/gradle.log" | tail -n 40 || true
+            exit "$RC"
+          fi
       - name: Verify IXWebSocket is linked
         run: |
           APK_PATH=$(find Builds/Android -name "*.apk" -type f | head -n 1)
